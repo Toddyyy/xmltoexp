@@ -1,0 +1,59 @@
+data:
+  data_dir: smoke_data
+  sequence_length: 32
+  stride: 16
+  train_split: 0.8
+  num_workers: 0
+  use_memory_cache: false
+  warmup_cache: false
+  memory_cache_size: 100
+model:
+  attn_dropout: 0.1
+  composer_embedding_dim: 64
+  condition_dim: 64
+  dim: 256
+  dim_head: 32
+  dropout: 0.1
+  emb_dropout: 0.1
+  ff_mult: 2
+  max_seq_len: 512
+  num_composers: 16
+  perf_decoder_depth: 2
+  perf_decoder_heads: 4
+  score_encoder_depth: 2
+  score_encoder_heads: 4
+  tempo_fusion_type: concat
+  tempo_hidden_dim: 128
+  tempo_predictor_type: multiscale
+  token_emb_mode: cat
+  use_composer_conditioning: true
+  use_musical_position: true
+  use_tempo_prediction: true
+trainer:
+  eval_every: 1
+  experiment_name: smoke
+  min_delta: 1.0e-6
+  patience: 2
+  save_dir: ./check/smoke
+  save_every: 1
+  use_wandb: false
+  wandb_project: smoke
+training:
+  accumulation_steps: 1
+  adam_betas:
+  - 0.9
+  - 0.95
+  adam_eps: 1.0e-08
+  batch_size: 2
+  learning_rate: 5e-4
+  max_epochs: 1
+  mixed_precision: false
+  grad_clip_value: 0.5
+  optimizer: adamw
+  weight_decay: 0.01
+  seed: 42
+  use_scheduler: false
+  tempo_loss_weight: 1
+  final_predicted_ratio: 0.5
+  start_predicted_epoch: 1
+  tempo_schedule_type: linear

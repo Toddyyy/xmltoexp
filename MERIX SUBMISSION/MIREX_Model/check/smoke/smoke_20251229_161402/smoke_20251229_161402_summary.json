@@ -1,0 +1,61 @@
+{
+  "experiment_name": "smoke_20251229_161402",
+  "total_epochs": 1,
+  "best_val_loss": 4.790631939967473,
+  "early_stopped": false,
+  "eval_token_types": [
+    "onset_deviation_in_seconds",
+    "duration_deviation_in_seconds",
+    "local_tempo",
+    "velocity",
+    "sustain_level",
+    "tempo_mean"
+  ],
+  "eval_loss_weights": {
+    "onset_deviation_in_seconds": 2.0,
+    "duration_deviation_in_seconds": 2.0,
+    "local_tempo": 1.5,
+    "velocity": 1.0,
+    "sustain_level": 1.0
+  },
+  "has_tempo_prediction": true,
+  "final_performance_metrics": {
+    "onset_deviation_in_seconds": {
+      "final_loss": 12.372880935668945,
+      "best_loss": 12.372880935668945,
+      "best_epoch": 1,
+      "improvement": 0.0
+    },
+    "duration_deviation_in_seconds": {
+      "final_loss": 2.6086606979370117,
+      "best_loss": 2.6086606979370117,
+      "best_epoch": 1,
+      "improvement": 0.0
+    },
+    "local_tempo": {
+      "final_loss": 2.213913917541504,
+      "best_loss": 2.213913917541504,
+      "best_epoch": 1,
+      "improvement": 0.0
+    },
+    "velocity": {
+      "final_loss": 2.506154775619507,
+      "best_loss": 2.506154775619507,
+      "best_epoch": 1,
+      "improvement": 0.0
+    },
+    "sustain_level": {
+      "final_loss": 0.13963063061237335,
+      "best_loss": 0.13963063061237335,
+      "best_epoch": 1,
+      "improvement": 0.0
+    }
+  },
+  "tempo_training": {
+    "schedule_type": "linear",
+    "start_predicted_epoch": 0,
+    "final_predicted_ratio": 0.5,
+    "combined_final_loss": 4.332996845245361,
+    "combined_best_loss": 4.332996845245361
+  }
+}

@@ -1,9 +1,11 @@
 """
-Prepare a tiny beat-level dataset from existing smoke_data for sanity check.
+Prepare a tiny note-level dataset from existing smoke_data for sanity check.
 
-We reuse smoke_data/sample.json to build a single-file beat dataset with:
-  - score_feats: simple per-beat features [beats, feature_dim]
-  - boundary_probs: random probs [beats]
+We reuse smoke_data/sample.json to build a single-file note dataset with:
+  - note_feats: [notes, feature_dim]
+  - beat_ids: [notes]
+  - boundary_probs: [beats] random probs
+  - num_beats: int
 Saved to beat_data_smoke/sample.npz
 """
 
@@ -21,28 +23,32 @@ def main():
     data = json.load(open(src))
     full_tokens = data["full_tokens"]
 
-    # Build a very simple beat-level representation: here we just take positions (beats) and durations
+    # Build simple note-level features:
+    # [pitch_midi, duration, position, part_idx, is_accent, is_staccato]
     positions = [t["score_note_token"]["position"] for t in full_tokens]
     durations = [t["score_note_token"]["duration"] for t in full_tokens]
     pitches = [t["performance_note_token"]["pitch"] for t in full_tokens]
+    part_ids = [t["score_note_token"]["part_id"] for t in full_tokens]
+    is_accent = [1.0 if t["score_note_token"].get("is_accent") else 0.0 for t in full_tokens]
+    is_staccato = [1.0 if t["score_note_token"].get("is_staccato") else 0.0 for t in full_tokens]
 
-    # To keep it trivial, we sort by position and group unique beat positions
-    # Feature vector: [avg_pitch/128, avg_duration, beat_index_norm]
-    beats = sorted(set(positions))
-    feats = []
-    for i, beat in enumerate(beats):
-        idxs = [j for j, p in enumerate(positions) if p == beat]
-        avg_pitch = np.mean([pitches[j] for j in idxs]) / 128.0
-        avg_dur = np.mean([durations[j] for j in idxs])
-        beat_norm = i / max(len(beats) - 1, 1)
-        feats.append([avg_pitch, avg_dur, beat_norm])
+    # Map part_id to index
+    part_vocab = {pid: idx for idx, pid in enumerate(sorted(set(part_ids)))}
+    part_idx = [float(part_vocab[p]) for p in part_ids]
 
-    feats = np.array(feats, dtype=np.float32)  # [beats, 3]
-    boundary_probs = np.random.rand(len(beats)).astype(np.float32)  # random supervision
+    note_feats = np.array(
+        list(zip(pitches, durations, positions, part_idx, is_accent, is_staccato)),
+        dtype=np.float32,
+    )
+
+    beat_unit = 1.0
+    beat_ids = np.array([int(round(p / beat_unit)) for p in positions], dtype=np.int32)
+    num_beats = int(beat_ids.max() + 1) if beat_ids.size > 0 else 0
+    boundary_probs = np.random.rand(num_beats).astype(np.float32)  # random supervision
 
     out_path = out_dir / "sample.npz"
-    np.savez(out_path, score_feats=feats, boundary_probs=boundary_probs)
-    print(f"Wrote smoke beat data to {out_path} with shape {feats.shape}")
+    np.savez(out_path, note_feats=note_feats, beat_ids=beat_ids, boundary_probs=boundary_probs, num_beats=num_beats)
+    print(f"Wrote smoke note data to {out_path} with shape {note_feats.shape}, beats={num_beats}")
 
 
 if __name__ == "__main__":

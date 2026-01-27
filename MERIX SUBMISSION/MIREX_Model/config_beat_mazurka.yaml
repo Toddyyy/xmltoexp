@@ -1,0 +1,52 @@
+data:
+  data_dir: beat_data_mazurka_performer   # directory with *.npz (note_feats + beat_ids + boundary_probs)
+  file_ext: npz
+  beat_sequence_length: 128      # set to int to slice by beats instead of notes
+  beat_stride: 128               # beat window stride (defaults to beat_sequence_length)
+  drop_short: true              # drop pieces shorter than sequence_length
+  max_len: null                 # no note truncation in beat-slice mode
+  position_mode: zero        # absolute|window|zero
+  use_base_features_only: true  # use only 6 base features
+  label_mode: dist            # ratio|dist|dual
+  dist_min_dist: 6              # min distance between peaks (beats)
+  dist_height: 0.15             # peak height threshold
+  dist_prominence: 0.05         # peak prominence threshold
+  dist_tau: 4.0                 # distance decay scale
+  train_split: 0.8
+  batch_size: 4
+  num_workers: 0
+  value_ranges:
+    pitch_midi: [0.0, 127.0]
+    duration: [0.0, 8.0]
+    position: [0.0, 1.0]
+    part_idx: [0.0, 7.0]
+    is_accent: [0.0, 1.0]
+    is_staccato: [0.0, 1.0]
+  label_binarize_threshold: null
+  piece_id_regex: '^(M\\d+-\\d+)'   # group by piece id for train/val split
+
+model:
+  input_dim: 6                 # 6 base features only
+  d_model: 128
+  nhead: 2
+  num_layers: 4
+  dim_feedforward: 512
+  dropout: 0.1
+  max_len: 512
+  include_empty_beats: true
+
+training:
+  epochs: 100
+
+  lr: 5.0e-4
+  weight_decay: 0.01
+  grad_clip: 1.0
+  loss_type: mse               # mse|bce|huber
+  pos_weight: 8.9
+  device: auto
+  seed: 42
+
+trainer:
+  save_dir: ./check/beat_mazurka
+  experiment_name: beat_mazurka
+  eval_every: 1

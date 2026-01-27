@@ -1,0 +1,38 @@
+data:
+  data_dir: beat_data_full_shift1        # directory with *.npz or *.pt, each has note_feats + beat_ids + boundary_probs
+  file_ext: npz
+  max_len: 16384              # truncate if longer; padding handled in collate
+  train_split: 1.0
+  batch_size: 1
+  num_workers: 0
+  value_ranges:
+    pitch_midi: [0.0, 127.0]
+    duration: [0.0, 8.0]
+    position: [0.0, 4096.0]
+    part_idx: [0.0, 7.0]
+    is_accent: [0.0, 1.0]
+    is_staccato: [0.0, 1.0]
+  label_binarize_threshold: 0.2
+
+model:
+  input_dim: 6                # feature_dim of note_feats
+  d_model: 256
+  nhead: 4
+  num_layers: 4 
+  dim_feedforward: 512
+  dropout: 0.0
+  max_len: 16384
+
+training:
+  epochs: 20
+  lr: 1.0e-3
+  weight_decay: 0.0
+  pos_weight: 10.0
+  grad_clip: 1.0
+  device: auto                # auto|cpu|cuda
+  seed: 42
+
+trainer:
+  save_dir: ./check/beat
+  experiment_name: beat_overfit
+  eval_every: 1

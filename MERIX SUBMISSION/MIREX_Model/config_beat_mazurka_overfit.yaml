@@ -1,0 +1,51 @@
+data:
+  data_dir: beat_data_mazurka_overfit   # directory with a single *.npz
+  file_ext: npz
+  sequence_length: 512
+  stride: 256
+  drop_short: false
+  max_len: 512
+  position_mode: window         # absolute|window|zero
+  use_base_features_only: true  # use only 6 base features
+  label_mode: dist
+  dist_min_dist: 6
+  dist_height: 0.15
+  dist_prominence: 0.05
+  dist_tau: 4.0
+  add_beat_pos: true
+  max_samples: 1
+  train_split: 1.0
+  batch_size: 1
+  num_workers: 0
+  value_ranges:
+    pitch_midi: [0.0, 127.0]
+    duration: [0.0, 8.0]
+    position: [0.0, 1.0]
+    part_idx: [0.0, 7.0]
+    is_accent: [0.0, 1.0]
+    is_staccato: [0.0, 1.0]
+  label_binarize_threshold: null
+
+model:
+  input_dim: 7
+  d_model: 256
+  nhead: 4
+  num_layers: 4
+  dim_feedforward: 512
+  dropout: 0.0
+  max_len: 512
+  include_empty_beats: true
+
+training:
+  epochs: 200
+  lr: 1.0e-3
+  weight_decay: 0.0
+  grad_clip: 1.0
+  loss_type: mse
+  device: auto
+  seed: 42
+
+trainer:
+  save_dir: ./check/beat_mazurka_overfit
+  experiment_name: beat_mazurka_overfit
+  eval_every: 1

@@ -1,11 +1,12 @@
 import argparse
 import os
 import random
+import re
 from datetime import datetime
 from pathlib import Path
 
 import torch
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, Subset
 import yaml
 
 from dataset_beat import BeatBoundaryDataset, collate_beat
@@ -25,27 +26,111 @@ def load_config(path: str):
         return yaml.safe_load(f)
 
 
+def print_batch_sanity(batch):
+    labels = batch["labels"]
+    beat_ids = batch["beat_ids"]
+    mask = batch["attn_mask"]
+    max_beats = int(batch["max_beats"].item())
+
+    labels_mean = labels.mean().item()
+    labels_std = labels.std().item()
+    labels_max = labels.max().item()
+    labels_sum = labels.sum().item()
+
+    valid = (beat_ids >= 0) & mask
+    valid_ids = beat_ids[valid]
+    beat_min = int(valid_ids.min().item()) if valid_ids.numel() > 0 else None
+    beat_max = int(valid_ids.max().item()) if valid_ids.numel() > 0 else None
+    note_count = int(mask.sum().item())
+
+    b0 = None
+    if beat_ids.size(0) > 0:
+        valid0 = (beat_ids[0] >= 0) & mask[0]
+        if valid0.any():
+            bc = torch.bincount(beat_ids[0][valid0], minlength=max_beats).tolist()
+            if len(bc) > 50:
+                b0 = (bc[:50], len(bc))
+            else:
+                b0 = (bc, len(bc))
+
+    print("Sanity A:")
+    print(
+        f"labels mean/std/max/sum = {labels_mean:.6f} / {labels_std:.6f} / {labels_max:.6f} / {labels_sum:.2f}"
+    )
+    print(f"beat_ids min/max = {beat_min} / {beat_max} | max_beats = {max_beats} | labels_len = {labels.shape[1]}")
+    print(f"valid note count (mask.sum) = {note_count}")
+    if b0 is None:
+        print("bincount(sample0) = <empty>")
+    elif b0[1] > 50:
+        print(f"bincount(sample0, first 50 of {b0[1]} beats) = {b0[0]}")
+    else:
+        print(f"bincount(sample0) = {b0[0]}")
+
+
+def set_bias_only(model):
+    for p in model.parameters():
+        p.requires_grad = False
+    if hasattr(model, "head") and model.head.bias is not None:
+        model.head.bias.requires_grad = True
+    if hasattr(model, "head") and model.head.weight is not None:
+        model.head.weight.data.zero_()
+        model.head.weight.requires_grad = False
+    return [p for p in model.parameters() if p.requires_grad]
+
+
 def create_dataloaders(cfg):
     dataset = BeatBoundaryDataset(
         data_dir=cfg["data"]["data_dir"],
         file_ext=cfg["data"]["file_ext"],
         max_len=cfg["data"]["max_len"],
+        sequence_length=cfg["data"].get("sequence_length"),
+        stride=cfg["data"].get("stride"),
+        beat_sequence_length=cfg["data"].get("beat_sequence_length"),
+        beat_stride=cfg["data"].get("beat_stride"),
+        drop_short=cfg["data"].get("drop_short", True),
+        position_mode=cfg["data"].get("position_mode", "absolute"),
+        use_base_features_only=cfg["data"].get("use_base_features_only", False),
+        label_mode=cfg["data"].get("label_mode", "ratio"),
+        dist_min_dist=cfg["data"].get("dist_min_dist", 6),
+        dist_height=cfg["data"].get("dist_height", 0.15),
+        dist_prominence=cfg["data"].get("dist_prominence", 0.05),
+        dist_tau=cfg["data"].get("dist_tau", 4.0),
+        add_beat_pos=cfg["data"].get("add_beat_pos", False),
+        max_samples=cfg["data"].get("max_samples"),
+        value_ranges=cfg["data"].get("value_ranges"),
+        label_binarize_threshold=cfg["data"].get("label_binarize_threshold"),
     )
 
-    total = len(dataset)
-    if total < 2:
-        # tiny dataset: use the same data for train/val
+    def piece_id_from_path(path: Path) -> str:
+        stem = path.stem
+        regex = cfg.get("data", {}).get("piece_id_regex")
+        if regex:
+            m = re.search(regex, stem)
+            if m:
+                return m.group(1) if m.groups() else m.group(0)
+        delim = cfg.get("data", {}).get("piece_id_delim")
+        if delim and delim in stem:
+            return stem.split(delim)[0]
+        return stem
+
+    piece_ids = [piece_id_from_path(s["path"]) for s in dataset.samples]
+    unique_pieces = list({pid for pid in piece_ids})
+    if len(unique_pieces) < 2:
         train_ds = dataset
         val_ds = dataset
     else:
-        train_size = int(cfg["data"]["train_split"] * total)
-        train_size = max(1, min(train_size, total - 1))
-        val_size = total - train_size
-        train_ds, val_ds = random_split(
-            dataset,
-            [train_size, val_size],
-            generator=torch.Generator().manual_seed(cfg["training"]["seed"]),
-        )
+        rng = random.Random(cfg["training"]["seed"])
+        rng.shuffle(unique_pieces)
+        train_count = int(cfg["data"]["train_split"] * len(unique_pieces))
+        train_count = max(1, min(train_count, len(unique_pieces) - 1))
+        train_pieces = set(unique_pieces[:train_count])
+        val_pieces = set(unique_pieces[train_count:])
+
+        train_indices = [i for i, pid in enumerate(piece_ids) if pid in train_pieces]
+        val_indices = [i for i, pid in enumerate(piece_ids) if pid in val_pieces]
+
+        train_ds = Subset(dataset, train_indices)
+        val_ds = Subset(dataset, val_indices)
 
     pad_to = cfg["data"]["max_len"]
     collate_fn = lambda batch: collate_beat(batch, pad_to=pad_to)
@@ -70,6 +155,10 @@ def create_dataloaders(cfg):
 
 
 def build_model(cfg, input_dim):
+    label_mode = cfg.get("data", {}).get("label_mode")
+    dual_head = cfg["model"].get("dual_head")
+    if dual_head is None:
+        dual_head = label_mode == "dual"
     model_cfg = BeatBoundaryConfig(
         input_dim=input_dim,
         d_model=cfg["model"]["d_model"],
@@ -78,53 +167,99 @@ def build_model(cfg, input_dim):
         dim_feedforward=cfg["model"]["dim_feedforward"],
         dropout=cfg["model"]["dropout"],
         max_len=cfg["model"]["max_len"],
+        fixed_beats=cfg["model"].get("fixed_beats"),
+        include_empty_beats=cfg["model"].get("include_empty_beats", False),
+        dual_head=dual_head,
+        note_rnn_hidden=cfg["model"].get("note_rnn_hidden"),
+        note_rnn_layers=cfg["model"].get("note_rnn_layers", 1),
+        note_rnn_dropout=cfg["model"].get("note_rnn_dropout", cfg["model"]["dropout"]),
     )
-    return BeatBoundaryModel(model_cfg)
+    pos_weight = cfg.get("training", {}).get("pos_weight")
+    loss_type = cfg.get("training", {}).get("loss_type", "bce")
+    prob_loss_type = cfg.get("training", {}).get("prob_loss_type", "bce")
+    prob_pos_weight = cfg.get("training", {}).get("prob_pos_weight")
+    prob_loss_weight = cfg.get("training", {}).get("prob_loss_weight", 1.0)
+    return BeatBoundaryModel(
+        model_cfg,
+        pos_weight=pos_weight,
+        loss_type=loss_type,
+        prob_loss_type=prob_loss_type,
+        prob_pos_weight=prob_pos_weight,
+        prob_loss_weight=prob_loss_weight,
+    )
 
 
 def train_one_epoch(model, loader, optimizer, device, grad_clip):
     model.train()
     total_loss = 0.0
-    total_tokens = 0
+    total_batches = 0
     for batch in loader:
-        score = batch["score_feats"].to(device)
+        note_feats = batch["note_feats"].to(device)
+        beat_ids = batch["beat_ids"].to(device)
         labels = batch["labels"].to(device)
+        labels_prob = batch.get("labels_prob")
+        if labels_prob is not None:
+            labels_prob = labels_prob.to(device)
         mask = batch["attn_mask"].to(device)
+        max_beats = int(batch["max_beats"].item())
+        num_beats = batch["num_beats"].to(device)
 
         optimizer.zero_grad()
-        _, loss = model(score, attn_mask=mask, labels=labels)
+        _, loss = model(
+            note_feats,
+            beat_ids=beat_ids,
+            num_beats=max_beats,
+            num_beats_per_sample=num_beats,
+            attn_mask=mask,
+            labels=labels,
+            labels_prob=labels_prob,
+        )
         loss.backward()
         if grad_clip:
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
 
-        tokens = mask.sum().item()
-        total_loss += loss.item() * tokens
-        total_tokens += tokens
-    return total_loss / max(total_tokens, 1)
+        total_loss += loss.item()
+        total_batches += 1
+    return total_loss / max(total_batches, 1)
 
 
 @torch.no_grad()
 def evaluate(model, loader, device):
     model.eval()
     total_loss = 0.0
-    total_tokens = 0
+    total_batches = 0
     for batch in loader:
-        score = batch["score_feats"].to(device)
+        note_feats = batch["note_feats"].to(device)
+        beat_ids = batch["beat_ids"].to(device)
         labels = batch["labels"].to(device)
+        labels_prob = batch.get("labels_prob")
+        if labels_prob is not None:
+            labels_prob = labels_prob.to(device)
         mask = batch["attn_mask"].to(device)
+        max_beats = int(batch["max_beats"].item())
+        num_beats = batch["num_beats"].to(device)
 
-        _, loss = model(score, attn_mask=mask, labels=labels)
-        tokens = mask.sum().item()
-        total_loss += loss.item() * tokens
-        total_tokens += tokens
-    return total_loss / max(total_tokens, 1)
+        _, loss = model(
+            note_feats,
+            beat_ids=beat_ids,
+            num_beats=max_beats,
+            num_beats_per_sample=num_beats,
+            attn_mask=mask,
+            labels=labels,
+            labels_prob=labels_prob,
+        )
+        total_loss += loss.item()
+        total_batches += 1
+    return total_loss / max(total_batches, 1)
 
 
 def main():
     parser = argparse.ArgumentParser(description="Train beat-level boundary model")
     parser.add_argument("--config", required=True, help="Path to config YAML")
     parser.add_argument("--device", default=None, help="cpu|cuda|auto")
+    parser.add_argument("--sanity_batch", action="store_true", help="Print one batch sanity stats and exit")
+    parser.add_argument("--bias_only", action="store_true", help="Train only head bias (all other params frozen)")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -142,12 +277,25 @@ def main():
     set_seed(cfg["training"]["seed"])
 
     train_loader, val_loader, input_dim = create_dataloaders(cfg)
+    if args.sanity_batch:
+        batch = next(iter(train_loader))
+        print_batch_sanity(batch)
+        return
     model = build_model(cfg, input_dim=input_dim).to(device)
 
+    trainable_params = model.parameters()
+    weight_decay = cfg["training"]["weight_decay"]
+    if args.bias_only:
+        trainable_params = set_bias_only(model)
+        if not trainable_params:
+            raise RuntimeError("Bias-only mode requested, but no trainable parameters found.")
+        weight_decay = 0.0
+        print("Bias-only training: head.weight zeroed; only head.bias is trainable.")
+
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        trainable_params,
         lr=cfg["training"]["lr"],
-        weight_decay=cfg["training"]["weight_decay"],
+        weight_decay=weight_decay,
     )
 
     # Prepare save dir

@@ -78,7 +78,7 @@ def set_bias_only(model):
     return [p for p in model.parameters() if p.requires_grad]
 
 
-def create_dataloaders(cfg):
+def create_dataloaders(cfg, level=None):
     dataset = BeatBoundaryDataset(
         data_dir=cfg["data"]["data_dir"],
         file_ext=cfg["data"]["file_ext"],
@@ -112,6 +112,13 @@ def create_dataloaders(cfg):
         if delim and delim in stem:
             return stem.split(delim)[0]
         return stem
+
+    if level is not None:
+        level_tag = f"_L{int(level)}"
+        filtered = [s for s in dataset.samples if Path(s["path"]).stem.endswith(level_tag)]
+        if not filtered:
+            raise ValueError(f"No samples found for level {level} (suffix {level_tag}) in {dataset.data_dir}")
+        dataset.samples = filtered
 
     piece_ids = [piece_id_from_path(s["path"]) for s in dataset.samples]
     unique_pieces = list({pid for pid in piece_ids})
@@ -260,9 +267,13 @@ def main():
     parser.add_argument("--device", default=None, help="cpu|cuda|auto")
     parser.add_argument("--sanity_batch", action="store_true", help="Print one batch sanity stats and exit")
     parser.add_argument("--bias_only", action="store_true", help="Train only head bias (all other params frozen)")
+    parser.add_argument("--level", type=int, default=None, help="Use only samples with suffix _L{level}.npz")
+    parser.add_argument("--pos_weight", type=float, default=None, help="Override training.pos_weight")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
+    if args.pos_weight is not None:
+        cfg.setdefault("training", {})["pos_weight"] = float(args.pos_weight)
 
     # Set device
     if args.device:
@@ -276,7 +287,7 @@ def main():
 
     set_seed(cfg["training"]["seed"])
 
-    train_loader, val_loader, input_dim = create_dataloaders(cfg)
+    train_loader, val_loader, input_dim = create_dataloaders(cfg, level=args.level)
     if args.sanity_batch:
         batch = next(iter(train_loader))
         print_batch_sanity(batch)
@@ -300,8 +311,15 @@ def main():
 
     # Prepare save dir
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    exp_name = f"{cfg['trainer']['experiment_name']}_{ts}"
-    save_dir = Path(cfg["trainer"]["save_dir"]) / exp_name
+    exp_name = cfg["trainer"]["experiment_name"]
+    if args.level is not None:
+        exp_name = f"{exp_name}_L{args.level}"
+    exp_name = f"{exp_name}_{ts}"
+
+    base_save_dir = Path(cfg["trainer"]["save_dir"])
+    if args.level is not None:
+        base_save_dir = base_save_dir / f"level_{args.level}"
+    save_dir = base_save_dir / exp_name
     save_dir.mkdir(parents=True, exist_ok=True)
 
     best_val = float("inf")

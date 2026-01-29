@@ -246,6 +246,11 @@ def main():
         help="Output dir for *.npz (default: ./beat_data_mazurka_performer_levels).",
     )
     parser.add_argument(
+        "--csv_dir",
+        default=None,
+        help="Output dir for boundary CSVs (default: ./beat_data_mazurka_performer).",
+    )
+    parser.add_argument(
         "--beat_unit",
         type=float,
         default=1.0,
@@ -313,6 +318,11 @@ def main():
         if args.out_dir
         else Path(__file__).resolve().parent / "beat_data_mazurka_performer_levels"
     )
+    csv_dir = (
+        Path(args.csv_dir)
+        if args.csv_dir
+        else Path(__file__).resolve().parent / "beat_data_mazurka_performer"
+    )
 
     if not beat_time_dir.exists():
         raise FileNotFoundError(f"beat_time_dir not found: {beat_time_dir}")
@@ -320,6 +330,7 @@ def main():
         raise FileNotFoundError(f"xml_dir not found: {xml_dir}")
 
     out_dir.mkdir(parents=True, exist_ok=True)
+    csv_dir.mkdir(parents=True, exist_ok=True)
     str_vec = parse_ws_list(args.str_vec)
     if not str_vec:
         raise ValueError("str_vec is empty; provide --str_vec like '3,2,2,2,2,2'.")
@@ -377,8 +388,12 @@ def main():
             beat_ids_safe = np.clip(beat_ids, 0, num_beats - 1)
             note_feats = np.concatenate([note_feats, beat_feats[beat_ids_safe]], axis=1)
 
+        avg_sum = np.zeros(num_beats, dtype=np.float64)
+        performer_count = 0
+
         for perf_id, curve in tempo_arrays.items():
             _, level_sets = group_analysis_hierarchy(curve, str_vec=str_vec, enforce_nested=True)
+            performer_count += 1
             for level_idx in range(1, len(str_vec) + 1):
                 locs = level_sets.get(level_idx, np.array([], dtype=int))
                 boundary = boundaries_to_mask(num_beats, locs)
@@ -400,6 +415,26 @@ def main():
                 stats["pos"] += int(boundary.sum())
                 stats["total"] += int(num_beats)
                 stats["files"] += 1
+
+                csv_path = csv_dir / f"{mazurka_id}_{perf_id}_L{level_idx}.csv"
+                pd.DataFrame(
+                    {
+                        "beat_index": np.arange(num_beats, dtype=int),
+                        "boundary_probability": boundary.astype(float),
+                    }
+                ).to_csv(csv_path, index=False)
+
+            avg_sum += boundaries_to_mask(num_beats, level_sets.get(1, np.array([], dtype=int)))
+
+        if performer_count > 0:
+            avg_prob = avg_sum / float(performer_count)
+            avg_path = csv_dir / f"{mazurka_id}_boundary_prob.csv"
+            pd.DataFrame(
+                {
+                    "beat_index": np.arange(num_beats, dtype=int),
+                    "boundary_probability": avg_prob.astype(float),
+                }
+            ).to_csv(avg_path, index=False)
 
     print(f"Wrote {total_written} npz files to {out_dir}")
     if skipped:

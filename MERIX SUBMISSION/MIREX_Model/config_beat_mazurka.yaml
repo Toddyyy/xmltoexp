@@ -7,7 +7,7 @@ data:
   max_len: null                 # no note truncation in beat-slice mode
   position_mode: zero        # absolute|window|zero
   use_base_features_only: true  # use only 6 base features
-  label_mode: ratio           # ratio|dist|dual
+  label_mode: dist           # ratio|dist|dual
   dist_min_dist: 6              # min distance between peaks (beats)
   dist_height: 0.15             # peak height threshold
   dist_prominence: 0.05         # peak prominence threshold
@@ -41,7 +41,7 @@ training:
   lr: 5.0e-4
   weight_decay: 0.01
   grad_clip: 1.0
-  loss_type: bce               # mse|bce|huber
+  loss_type: mse               # mse|bce|huber
   pos_weight: 8.9
   device: auto
   seed: 42

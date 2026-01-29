@@ -14,7 +14,7 @@ cd "$SLURM_SUBMIT_DIR"
 source .venv/bin/activate
 
 python train_beat.py \
-  --config config_beat_mazurka.yaml \
+  --config config_beat_mazurka_a800.yaml \
   --level 6 \
   --pos_weight 239.6 \
   --device cuda

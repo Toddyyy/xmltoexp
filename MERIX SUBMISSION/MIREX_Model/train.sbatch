@@ -1,8 +1,8 @@
 #!/bin/bash
-#SBATCH --job-name=beat_L4
-#SBATCH --partition=gpua800
+#SBATCH --job-name=1
+#SBATCH --partition=gpu3090
 #SBATCH --gres=gpu:1
-#SBATCH --qos=1a800
+#SBATCH --qos=1gpu
 #SBATCH --output=slurm-%j.out
 #SBATCH --error=slurm-%j.err
 #SBATCH --time=12:00:00
@@ -14,7 +14,7 @@ cd "$SLURM_SUBMIT_DIR"
 source .venv/bin/activate
 
 python train_beat.py \
-  --config config_beat_mazurka_level4.yaml \
-  --level 4 \
-  --pos_weight 39.8 \
+  --config config_beat_mazurka_level1.yaml \
+  --level 1 \
+  --pos_weight 3.81 \
   --device cuda

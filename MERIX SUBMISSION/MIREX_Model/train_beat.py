@@ -90,6 +90,7 @@ def create_dataloaders(cfg, level=None):
         drop_short=cfg["data"].get("drop_short", True),
         position_mode=cfg["data"].get("position_mode", "absolute"),
         use_base_features_only=cfg["data"].get("use_base_features_only", False),
+        performer_id_regex=cfg["data"].get("performer_id_regex"),
         label_mode=cfg["data"].get("label_mode", "ratio"),
         dist_min_dist=cfg["data"].get("dist_min_dist", 6),
         dist_height=cfg["data"].get("dist_height", 0.15),
@@ -158,7 +159,7 @@ def create_dataloaders(cfg, level=None):
         collate_fn=collate_fn,
         pin_memory=True,
     )
-    return train_loader, val_loader, dataset.feature_dim
+    return train_loader, val_loader, dataset.feature_dim, dataset
 
 
 def build_model(cfg, input_dim):
@@ -180,6 +181,9 @@ def build_model(cfg, input_dim):
         note_rnn_hidden=cfg["model"].get("note_rnn_hidden"),
         note_rnn_layers=cfg["model"].get("note_rnn_layers", 1),
         note_rnn_dropout=cfg["model"].get("note_rnn_dropout", cfg["model"]["dropout"]),
+        performer_cond=cfg["model"].get("performer_cond", False),
+        performer_emb_dim=cfg["model"].get("performer_emb_dim", 32),
+        performer_vocab_size=cfg["model"].get("performer_vocab_size", 0),
     )
     pos_weight = cfg.get("training", {}).get("pos_weight")
     loss_type = cfg.get("training", {}).get("loss_type", "bce")
@@ -210,6 +214,9 @@ def train_one_epoch(model, loader, optimizer, device, grad_clip):
         mask = batch["attn_mask"].to(device)
         max_beats = int(batch["max_beats"].item())
         num_beats = batch["num_beats"].to(device)
+        performer_ids = batch.get("performer_ids")
+        if performer_ids is not None:
+            performer_ids = performer_ids.to(device)
 
         optimizer.zero_grad()
         _, loss = model(
@@ -217,6 +224,7 @@ def train_one_epoch(model, loader, optimizer, device, grad_clip):
             beat_ids=beat_ids,
             num_beats=max_beats,
             num_beats_per_sample=num_beats,
+            performer_ids=performer_ids,
             attn_mask=mask,
             labels=labels,
             labels_prob=labels_prob,
@@ -246,12 +254,16 @@ def evaluate(model, loader, device):
         mask = batch["attn_mask"].to(device)
         max_beats = int(batch["max_beats"].item())
         num_beats = batch["num_beats"].to(device)
+        performer_ids = batch.get("performer_ids")
+        if performer_ids is not None:
+            performer_ids = performer_ids.to(device)
 
         _, loss = model(
             note_feats,
             beat_ids=beat_ids,
             num_beats=max_beats,
             num_beats_per_sample=num_beats,
+            performer_ids=performer_ids,
             attn_mask=mask,
             labels=labels,
             labels_prob=labels_prob,
@@ -267,6 +279,11 @@ def main():
     parser.add_argument("--device", default=None, help="cpu|cuda|auto")
     parser.add_argument("--sanity_batch", action="store_true", help="Print one batch sanity stats and exit")
     parser.add_argument("--bias_only", action="store_true", help="Train only head bias (all other params frozen)")
+    parser.add_argument(
+        "--freeze_base",
+        action="store_true",
+        help="Freeze backbone and train only performer conditioning params",
+    )
     parser.add_argument("--level", type=int, default=None, help="Use only samples with suffix _L{level}.npz")
     parser.add_argument("--pos_weight", type=float, default=None, help="Override training.pos_weight")
     args = parser.parse_args()
@@ -287,11 +304,15 @@ def main():
 
     set_seed(cfg["training"]["seed"])
 
-    train_loader, val_loader, input_dim = create_dataloaders(cfg, level=args.level)
+    train_loader, val_loader, input_dim, dataset = create_dataloaders(cfg, level=args.level)
     if args.sanity_batch:
         batch = next(iter(train_loader))
         print_batch_sanity(batch)
         return
+    if cfg.get("model", {}).get("performer_cond"):
+        if dataset.num_performers <= 0:
+            raise ValueError("performer_cond is enabled but no performer IDs were found in filenames.")
+        cfg["model"]["performer_vocab_size"] = int(dataset.num_performers) + 1
     model = build_model(cfg, input_dim=input_dim).to(device)
 
     trainable_params = model.parameters()
@@ -302,6 +323,13 @@ def main():
             raise RuntimeError("Bias-only mode requested, but no trainable parameters found.")
         weight_decay = 0.0
         print("Bias-only training: head.weight zeroed; only head.bias is trainable.")
+    if args.freeze_base or cfg["training"].get("freeze_base", False):
+        for name, param in model.named_parameters():
+            param.requires_grad = name.startswith("performer_")
+        trainable_params = [p for p in model.parameters() if p.requires_grad]
+        if not trainable_params:
+            raise RuntimeError("Freeze-base requested, but no performer conditioning params found.")
+        print("Freeze-base: only performer conditioning params are trainable.")
 
     optimizer = torch.optim.AdamW(
         trainable_params,
@@ -321,6 +349,9 @@ def main():
         base_save_dir = base_save_dir / f"level_{args.level}"
     save_dir = base_save_dir / exp_name
     save_dir.mkdir(parents=True, exist_ok=True)
+    if cfg.get("model", {}).get("performer_cond") and getattr(dataset, "performer_map", None):
+        with (save_dir / "performer_map.yaml").open("w") as f:
+            yaml.safe_dump(dataset.performer_map, f)
 
     best_val = float("inf")
     epochs = cfg["training"]["epochs"]

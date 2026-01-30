@@ -1,4 +1,5 @@
 import glob
+import re
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 
@@ -48,6 +49,7 @@ class BeatBoundaryDataset(Dataset):
         max_samples: Optional[int] = None,
         value_ranges: Optional[Dict[str, List[float]]] = None,
         label_binarize_threshold: Optional[float] = None,
+        performer_id_regex: Optional[str] = None,
     ):
         super().__init__()
         self.data_dir = Path(data_dir)
@@ -77,6 +79,7 @@ class BeatBoundaryDataset(Dataset):
         ]
         self.value_ranges = self._build_value_ranges(value_ranges)
         self.label_binarize_threshold = label_binarize_threshold
+        self.performer_id_regex = performer_id_regex
         if self.position_mode not in {"absolute", "window", "zero"}:
             raise ValueError("position_mode must be one of: absolute, window, zero")
         if self.label_mode not in {"ratio", "dist", "dual"}:
@@ -92,6 +95,8 @@ class BeatBoundaryDataset(Dataset):
             raise FileNotFoundError(
                 f"No valid *.{self.file_ext} files with required keys in {self.data_dir}"
             )
+        self.performer_map = self._build_performer_map()
+        self.num_performers = len(self.performer_map)
 
         # Peek to infer feature dimension
         first = self._load_file(self.files[0])
@@ -118,6 +123,36 @@ class BeatBoundaryDataset(Dataset):
         except Exception:
             return False
         return False
+
+    def _extract_performer_tag(self, path: Path) -> Optional[str]:
+        stem = path.stem
+        regex = self.performer_id_regex or r"(pid[^_]+)"
+        try:
+            m = re.search(regex, stem)
+        except re.error:
+            return None
+        if not m:
+            return None
+        return m.group(1) if m.groups() else m.group(0)
+
+    def _build_performer_map(self) -> Dict[str, int]:
+        tags = []
+        for path in self.files:
+            tag = self._extract_performer_tag(path)
+            if tag:
+                tags.append(tag)
+        if not tags:
+            return {}
+        uniq = sorted(set(tags))
+        return {tag: idx + 1 for idx, tag in enumerate(uniq)}
+
+    def _get_performer_id(self, path: Path) -> int:
+        if not self.performer_map:
+            return 0
+        tag = self._extract_performer_tag(path)
+        if not tag:
+            return 0
+        return int(self.performer_map.get(tag, 0))
 
     def _get_note_len(self, path: Path) -> int:
         if self.file_ext == "npz":
@@ -423,6 +458,7 @@ class BeatBoundaryDataset(Dataset):
         beat_ids = data["beat_ids"]
         labels_ratio = data["boundary_probs"]
         num_beats = data["num_beats"]
+        performer_id = self._get_performer_id(sample["path"])
 
         labels_dist = None
         if self.label_mode in {"dist", "dual"}:
@@ -480,6 +516,7 @@ class BeatBoundaryDataset(Dataset):
             "labels": labels_t,
             "num_beats": num_beats,
             "length": length,
+            "performer_id": performer_id,
         }
         if self.label_mode == "dual":
             out["labels_prob"] = torch.tensor(labels_ratio, dtype=torch.float32)
@@ -498,6 +535,8 @@ def collate_beat(batch: List[Dict[str, Any]], pad_to: Optional[int] = None) -> D
     labels = torch.zeros(len(batch), max_beats, dtype=torch.float32)
     has_prob = any("labels_prob" in b for b in batch)
     labels_prob = torch.zeros(len(batch), max_beats, dtype=torch.float32) if has_prob else None
+    has_performer = any("performer_id" in b for b in batch)
+    performer_ids = torch.zeros(len(batch), dtype=torch.long) if has_performer else None
     attn_mask = torch.zeros(len(batch), max_len, dtype=torch.bool)
 
     for i, item in enumerate(batch):
@@ -509,6 +548,8 @@ def collate_beat(batch: List[Dict[str, Any]], pad_to: Optional[int] = None) -> D
         if has_prob and "labels_prob" in item and item["labels_prob"].numel() > 0:
             labels_prob[i, : item["labels_prob"].shape[0]] = item["labels_prob"]
         attn_mask[i, :l] = True
+        if has_performer:
+            performer_ids[i] = int(item.get("performer_id", 0))
 
     out = {
         "note_feats": note_feats,
@@ -521,4 +562,6 @@ def collate_beat(batch: List[Dict[str, Any]], pad_to: Optional[int] = None) -> D
     }
     if has_prob:
         out["labels_prob"] = labels_prob
+    if has_performer:
+        out["performer_ids"] = performer_ids
     return out

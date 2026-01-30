@@ -44,11 +44,11 @@ training:
   lr: 5.0e-4
   weight_decay: 0.01
   grad_clip: 1.0
-  loss_type: mse               # mse(dist)|bce(ratio)|huber
+  loss_type: mse               # mse|bce|huber
   pos_weight: 8.9
   device: auto
   seed: 42
-  freeze_base: false
+  freeze_base: true
 
 trainer:
   save_dir: ./check/beat_mazurka

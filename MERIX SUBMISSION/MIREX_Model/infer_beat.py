@@ -53,6 +53,9 @@ def build_model(cfg, input_dim: int) -> BeatBoundaryModel:
         note_rnn_hidden=cfg["model"].get("note_rnn_hidden"),
         note_rnn_layers=cfg["model"].get("note_rnn_layers", 1),
         note_rnn_dropout=cfg["model"].get("note_rnn_dropout", cfg["model"]["dropout"]),
+        performer_cond=cfg["model"].get("performer_cond", False),
+        performer_emb_dim=cfg["model"].get("performer_emb_dim", 32),
+        performer_vocab_size=cfg["model"].get("performer_vocab_size", 0),
     )
     pos_weight = cfg.get("training", {}).get("pos_weight")
     loss_type = cfg.get("training", {}).get("loss_type", "bce")
@@ -166,6 +169,12 @@ def main():
         default=None,
         help="Select which head to output (dist or prob).",
     )
+    parser.add_argument(
+        "--performer_id",
+        type=int,
+        default=None,
+        help="Optional performer id for conditional logits (0 or None = no conditioning).",
+    )
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -215,6 +224,9 @@ def main():
         output_head = "prob" if dual_head else "dist"
     if output_head == "prob" and not dual_head:
         raise ValueError("Requested prob head but dual_head is disabled in config.")
+    performer_ids = None
+    if args.performer_id is not None:
+        performer_ids = torch.tensor([int(args.performer_id)], device=device, dtype=torch.long)
 
     loss_type = cfg.get("training", {}).get("loss_type", "bce")
     prob_loss_type = cfg.get("training", {}).get("prob_loss_type", "bce")
@@ -241,6 +253,7 @@ def main():
                 feats_t,
                 beat_ids=beat_ids_t,
                 num_beats=num_beats,
+                performer_ids=performer_ids,
                 attn_mask=attn_mask,
                 labels=None,
                 output_head=output_head,
@@ -287,6 +300,7 @@ def main():
                     feats_t,
                     beat_ids=beat_ids_t,
                     num_beats=end - start,
+                    performer_ids=performer_ids,
                     attn_mask=attn_mask,
                     labels=None,
                     output_head=output_head,

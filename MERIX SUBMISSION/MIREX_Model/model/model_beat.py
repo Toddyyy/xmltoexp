@@ -65,6 +65,9 @@ class BeatBoundaryConfig:
     note_rnn_hidden: Optional[int] = None
     note_rnn_layers: int = 1
     note_rnn_dropout: float = 0.0
+    performer_cond: bool = False
+    performer_emb_dim: int = 32
+    performer_vocab_size: int = 0
 
 
 class BeatBoundaryModel(nn.Module):
@@ -89,6 +92,7 @@ class BeatBoundaryModel(nn.Module):
         self.prob_loss_type = prob_loss_type.lower()
         self.prob_pos_weight = prob_pos_weight if prob_pos_weight is not None else pos_weight
         self.prob_loss_weight = float(prob_loss_weight)
+        self.performer_cond = bool(config.performer_cond)
         rnn_hidden = config.note_rnn_hidden
         if rnn_hidden is None:
             rnn_hidden = max(1, config.d_model // 2)
@@ -111,6 +115,18 @@ class BeatBoundaryModel(nn.Module):
         )
         self.beat_encoder = nn.TransformerEncoder(encoder_layer, num_layers=config.num_layers)
         self.head = nn.Linear(config.d_model, 1)
+        self.performer_emb = None
+        self.performer_proj = None
+        if self.performer_cond:
+            if config.performer_vocab_size <= 0:
+                raise ValueError("performer_vocab_size must be > 0 when performer_cond is enabled.")
+            self.performer_emb = nn.Embedding(
+                int(config.performer_vocab_size),
+                int(config.performer_emb_dim),
+                padding_idx=0,
+            )
+            self.performer_proj = nn.Linear(int(config.performer_emb_dim), config.d_model, bias=False)
+            nn.init.zeros_(self.performer_proj.weight)
         self.loss_fn, self.loss_on_logits = self._build_loss_fn(self.loss_type, pos_weight)
         self.head_prob = None
         self.prob_loss_fn = None
@@ -143,6 +159,7 @@ class BeatBoundaryModel(nn.Module):
         beat_ids: Tensor,
         num_beats: Optional[int] = None,
         num_beats_per_sample: Optional[Tensor] = None,
+        performer_ids: Optional[Tensor] = None,
         attn_mask: Optional[Tensor] = None,
         labels: Optional[Tensor] = None,
         labels_prob: Optional[Tensor] = None,
@@ -202,6 +219,16 @@ class BeatBoundaryModel(nn.Module):
         logits_prob = None
         if self.dual_head:
             logits_prob = self.head_prob(enc).squeeze(-1)
+        if self.performer_cond and performer_ids is not None:
+            performer_ids = performer_ids.to(device)
+            if performer_ids.dim() == 0:
+                performer_ids = performer_ids.unsqueeze(0)
+            performer_ids = performer_ids.view(-1).long()
+            cond = self.performer_proj(self.performer_emb(performer_ids))  # [B, d_model]
+            delta = torch.einsum("btd,bd->bt", enc, cond) / math.sqrt(cond.size(-1))
+            logits_dist = logits_dist + delta
+            if logits_prob is not None:
+                logits_prob = logits_prob + delta
 
         loss = None
         if labels is not None:

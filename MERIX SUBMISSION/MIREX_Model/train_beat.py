@@ -78,7 +78,83 @@ def set_bias_only(model):
     return [p for p in model.parameters() if p.requires_grad]
 
 
-def create_dataloaders(cfg, level=None):
+def load_piece_split(path: str):
+    with open(path, "r") as f:
+        data = yaml.safe_load(f)
+    if not isinstance(data, dict):
+        raise ValueError(f"Split file must be a mapping, got: {type(data).__name__}")
+    train_pieces = set(data.get("train", []) or [])
+    val_pieces = set(data.get("val", []) or [])
+    test_pieces = set(data.get("test", []) or [])
+    if not train_pieces or not val_pieces:
+        raise ValueError("Split file must define non-empty 'train' and 'val' lists.")
+    if train_pieces & val_pieces or train_pieces & test_pieces or val_pieces & test_pieces:
+        raise ValueError("train/val/test piece ids in split file must be disjoint.")
+    return {
+        "train": train_pieces,
+        "val": val_pieces,
+        "test": test_pieces,
+    }
+
+
+def load_aux_split(path: str):
+    with open(path, "r") as f:
+        data = yaml.safe_load(f)
+    if not isinstance(data, dict):
+        raise ValueError(f"Aux split file must be a mapping, got: {type(data).__name__}")
+    return data
+
+
+def recording_id_from_path(path: Path) -> str | None:
+    stem = path.stem
+    parts = stem.split("_")
+    for part in parts[1:]:
+        if part.startswith("pid"):
+            return part
+    m = re.search(r"(pid[^_]+)", stem)
+    if m:
+        return m.group(1)
+    return None
+
+
+def build_aux_filters(aux_data, aux_mode=None, aux_targets=None):
+    if not aux_mode:
+        return None
+    targets = set(aux_targets or [])
+    if aux_mode == "heldout_pianists":
+        entries = aux_data.get("heldout_pianists", []) or []
+        if targets:
+            entries = [e for e in entries if e.get("name") in targets]
+        excluded_ids = {rid for e in entries for rid in (e.get("recording_ids", []) or [])}
+        return {
+            "mode": aux_mode,
+            "excluded_ids": excluded_ids,
+            "selected_targets": sorted(e.get("name") for e in entries),
+        }
+    if aux_mode == "same_piece_80":
+        entries = aux_data.get("same_piece_80_percent", []) or []
+        if targets:
+            entries = [e for e in entries if e.get("piece") in targets]
+        keep_map = {
+            e.get("piece"): set(e.get("keep_recording_ids", []) or [])
+            for e in entries
+            if e.get("piece")
+        }
+        holdout_map = {
+            e.get("piece"): set(e.get("holdout_recording_ids", []) or [])
+            for e in entries
+            if e.get("piece")
+        }
+        return {
+            "mode": aux_mode,
+            "keep_map": keep_map,
+            "holdout_map": holdout_map,
+            "selected_targets": sorted(keep_map.keys()),
+        }
+    raise ValueError(f"Unsupported aux_mode: {aux_mode}")
+
+
+def create_dataloaders(cfg, level=None, split_file=None, aux_split_file=None, aux_mode=None, aux_targets=None):
     dataset = BeatBoundaryDataset(
         data_dir=cfg["data"]["data_dir"],
         file_ext=cfg["data"]["file_ext"],
@@ -107,6 +183,11 @@ def create_dataloaders(cfg, level=None):
         regex = cfg.get("data", {}).get("piece_id_regex")
         if regex:
             m = re.search(regex, stem)
+            if not m and "\\\\" in regex:
+                try:
+                    m = re.search(regex.encode("utf-8").decode("unicode_escape"), stem)
+                except Exception:
+                    m = None
             if m:
                 return m.group(1) if m.groups() else m.group(0)
         delim = cfg.get("data", {}).get("piece_id_delim")
@@ -121,11 +202,66 @@ def create_dataloaders(cfg, level=None):
             raise ValueError(f"No samples found for level {level} (suffix {level_tag}) in {dataset.data_dir}")
         dataset.samples = filtered
 
+    aux_summary = {"mode": aux_mode, "selected_targets": [], "excluded_ids": 0, "restricted_pieces": []}
+    if aux_split_file and aux_mode:
+        aux_data = load_aux_split(aux_split_file)
+        aux_filter = build_aux_filters(aux_data, aux_mode=aux_mode, aux_targets=aux_targets)
+        filtered_samples = []
+        if aux_filter["mode"] == "heldout_pianists":
+            excluded_ids = set(aux_filter["excluded_ids"])
+            for s in dataset.samples:
+                rid = recording_id_from_path(Path(s["path"]))
+                if rid not in excluded_ids:
+                    filtered_samples.append(s)
+            aux_summary = {
+                "mode": aux_mode,
+                "selected_targets": aux_filter["selected_targets"],
+                "excluded_ids": len(excluded_ids),
+                "restricted_pieces": [],
+            }
+        elif aux_filter["mode"] == "same_piece_80":
+            keep_map = aux_filter["keep_map"]
+            restricted_pieces = sorted(keep_map.keys())
+            for s in dataset.samples:
+                piece = piece_id_from_path(Path(s["path"]))
+                rid = recording_id_from_path(Path(s["path"]))
+                if piece in keep_map:
+                    if rid in keep_map[piece]:
+                        filtered_samples.append(s)
+                else:
+                    filtered_samples.append(s)
+            aux_summary = {
+                "mode": aux_mode,
+                "selected_targets": aux_filter["selected_targets"],
+                "excluded_ids": 0,
+                "restricted_pieces": restricted_pieces,
+            }
+        else:
+            filtered_samples = dataset.samples
+        if not filtered_samples:
+            raise ValueError("Auxiliary filtering removed all samples.")
+        dataset.samples = filtered_samples
+
     piece_ids = [piece_id_from_path(s["path"]) for s in dataset.samples]
     unique_pieces = list({pid for pid in piece_ids})
-    if len(unique_pieces) < 2:
+    split_meta = None
+    if split_file:
+        split_meta = load_piece_split(split_file)
+        known = set(unique_pieces)
+        requested = split_meta["train"] | split_meta["val"] | split_meta["test"]
+        missing = sorted(requested - known)
+        if missing:
+            raise ValueError(f"Split file references pieces not found in dataset: {missing}")
+        train_indices = [i for i, pid in enumerate(piece_ids) if pid in split_meta["train"]]
+        val_indices = [i for i, pid in enumerate(piece_ids) if pid in split_meta["val"]]
+        test_indices = [i for i, pid in enumerate(piece_ids) if pid in split_meta["test"]]
+        train_ds = Subset(dataset, train_indices)
+        val_ds = Subset(dataset, val_indices)
+        test_ds = Subset(dataset, test_indices) if test_indices else None
+    elif len(unique_pieces) < 2:
         train_ds = dataset
         val_ds = dataset
+        test_ds = None
     else:
         rng = random.Random(cfg["training"]["seed"])
         rng.shuffle(unique_pieces)
@@ -139,6 +275,7 @@ def create_dataloaders(cfg, level=None):
 
         train_ds = Subset(dataset, train_indices)
         val_ds = Subset(dataset, val_indices)
+        test_ds = None
 
     pad_to = cfg["data"]["max_len"]
     collate_fn = lambda batch: collate_beat(batch, pad_to=pad_to)
@@ -159,7 +296,24 @@ def create_dataloaders(cfg, level=None):
         collate_fn=collate_fn,
         pin_memory=True,
     )
-    return train_loader, val_loader, dataset.feature_dim, dataset
+    test_loader = None
+    if test_ds is not None:
+        test_loader = DataLoader(
+            test_ds,
+            batch_size=cfg["data"]["batch_size"],
+            shuffle=False,
+            num_workers=cfg["data"]["num_workers"],
+            collate_fn=collate_fn,
+            pin_memory=True,
+        )
+    split_summary = {
+        "all_pieces": sorted(unique_pieces),
+        "train_pieces": sorted({piece_ids[i] for i in train_indices}) if isinstance(train_ds, Subset) else sorted(unique_pieces),
+        "val_pieces": sorted({piece_ids[i] for i in val_indices}) if isinstance(val_ds, Subset) else sorted(unique_pieces),
+        "test_pieces": sorted({piece_ids[i] for i in test_indices}) if split_meta and split_meta["test"] else [],
+        "aux_filter": aux_summary,
+    }
+    return train_loader, val_loader, test_loader, dataset.feature_dim, dataset, split_summary
 
 
 def build_model(cfg, input_dim):
@@ -286,6 +440,19 @@ def main():
     )
     parser.add_argument("--level", type=int, default=None, help="Use only samples with suffix _L{level}.npz")
     parser.add_argument("--pos_weight", type=float, default=None, help="Override training.pos_weight")
+    parser.add_argument("--split_file", default=None, help="YAML file with explicit piece-level train/val/test splits")
+    parser.add_argument("--aux_split_file", default=None, help="YAML file with auxiliary performer holdout definitions")
+    parser.add_argument(
+        "--aux_mode",
+        default=None,
+        choices=["heldout_pianists", "same_piece_80"],
+        help="Apply auxiliary filtering on top of piece split",
+    )
+    parser.add_argument(
+        "--aux_targets",
+        default=None,
+        help="Comma-separated pianist names or piece ids to select a subset from aux split file",
+    )
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -304,7 +471,15 @@ def main():
 
     set_seed(cfg["training"]["seed"])
 
-    train_loader, val_loader, input_dim, dataset = create_dataloaders(cfg, level=args.level)
+    aux_targets = [x.strip() for x in args.aux_targets.split(",")] if args.aux_targets else None
+    train_loader, val_loader, test_loader, input_dim, dataset, split_summary = create_dataloaders(
+        cfg,
+        level=args.level,
+        split_file=args.split_file,
+        aux_split_file=args.aux_split_file,
+        aux_mode=args.aux_mode,
+        aux_targets=aux_targets,
+    )
     if args.sanity_batch:
         batch = next(iter(train_loader))
         print_batch_sanity(batch)
@@ -349,6 +524,8 @@ def main():
         base_save_dir = base_save_dir / f"level_{args.level}"
     save_dir = base_save_dir / exp_name
     save_dir.mkdir(parents=True, exist_ok=True)
+    with (save_dir / "split_summary.yaml").open("w") as f:
+        yaml.safe_dump(split_summary, f, sort_keys=False)
     if cfg.get("model", {}).get("performer_cond") and getattr(dataset, "performer_map", None):
         with (save_dir / "performer_map.yaml").open("w") as f:
             yaml.safe_dump(dataset.performer_map, f)
@@ -366,6 +543,27 @@ def main():
             best_val = val_loss
             torch.save(model.state_dict(), save_dir / "best.pt")
         torch.save(model.state_dict(), save_dir / "last.pt")
+
+    if test_loader is not None:
+        best_model = build_model(cfg, input_dim=input_dim).to(device)
+        best_model.load_state_dict(torch.load(save_dir / "best.pt", map_location=device))
+        best_test_loss = evaluate(best_model, test_loader, device)
+
+        last_model = build_model(cfg, input_dim=input_dim).to(device)
+        last_model.load_state_dict(torch.load(save_dir / "last.pt", map_location=device))
+        last_test_loss = evaluate(last_model, test_loader, device)
+
+        print(f"Test | best_loss {best_test_loss:.4f} | last_loss {last_test_loss:.4f}")
+        with (save_dir / "test_metrics.yaml").open("w") as f:
+            yaml.safe_dump(
+                {
+                    "best_test_loss": float(best_test_loss),
+                    "last_test_loss": float(last_test_loss),
+                    "test_pieces": split_summary["test_pieces"],
+                },
+                f,
+                sort_keys=False,
+            )
 
 
 if __name__ == "__main__":

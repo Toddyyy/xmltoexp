@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=1
+#SBATCH --job-name=beat_sal
 #SBATCH --partition=gpu3090
 #SBATCH --gres=gpu:1
 #SBATCH --qos=1gpu
@@ -13,8 +13,12 @@ set -e
 cd "$SLURM_SUBMIT_DIR"
 source .venv/bin/activate
 
-python train_beat.py \
-  --config config_beat_mazurka_level6_ratio.yaml \
-  --level 6 \
-  --pos_weight 239.59 \
+python train_beat_salience.py \
+  --config config_beat_mazurka_salience.yaml \
+  --split_file splits/mazurka_piece_split_v1.yaml \
+  --aux_split_file splits/mazurka_aux_performer_split_v1.yaml \
+  --aux_mode heldout_pianists \
+  --aux_targets Ashkenazy,Cohen \
+  --levels 1,2,3,4,5 \
+  --level_weights 3,6,12,24,48 \
   --device cuda

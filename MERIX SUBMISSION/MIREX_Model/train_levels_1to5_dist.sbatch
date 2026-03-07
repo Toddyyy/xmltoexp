@@ -1,8 +1,8 @@
 #!/bin/bash
 #SBATCH --job-name=beat_L1to5
-#SBATCH --partition=gpu3090
+#SBATCH --partition=gpua800
 #SBATCH --gres=gpu:1
-#SBATCH --qos=1gpu
+#SBATCH --qos=1a800
 #SBATCH --output=slurm-%j.out
 #SBATCH --error=slurm-%j.err
 #SBATCH --time=24:00:00

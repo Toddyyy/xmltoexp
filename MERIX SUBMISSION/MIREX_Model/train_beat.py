@@ -453,6 +453,8 @@ def main():
         default=None,
         help="Comma-separated pianist names or piece ids to select a subset from aux split file",
     )
+    parser.add_argument("--early_stop_patience", type=int, default=8, help="Stop if val loss does not improve for N epochs")
+    parser.add_argument("--early_stop_min_delta", type=float, default=0.0, help="Minimum val-loss improvement to reset patience")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -531,18 +533,41 @@ def main():
             yaml.safe_dump(dataset.performer_map, f)
 
     best_val = float("inf")
+    best_epoch = 0
     epochs = cfg["training"]["epochs"]
     grad_clip = cfg["training"].get("grad_clip", None)
+    patience = max(int(args.early_stop_patience), 0)
+    min_delta = float(args.early_stop_min_delta)
+    bad_epochs = 0
 
     for epoch in range(1, epochs + 1):
         train_loss = train_one_epoch(model, train_loader, optimizer, device, grad_clip)
         val_loss = evaluate(model, val_loader, device)
         print(f"Epoch {epoch}/{epochs} | train_loss {train_loss:.4f} | val_loss {val_loss:.4f}")
 
-        if val_loss < best_val:
+        if val_loss < (best_val - min_delta):
             best_val = val_loss
+            best_epoch = epoch
+            bad_epochs = 0
             torch.save(model.state_dict(), save_dir / "best.pt")
+            with (save_dir / "best_metrics.yaml").open("w") as f:
+                yaml.safe_dump(
+                    {
+                        "best_epoch": int(best_epoch),
+                        "best_val_loss": float(best_val),
+                    },
+                    f,
+                    sort_keys=False,
+                )
+        else:
+            bad_epochs += 1
         torch.save(model.state_dict(), save_dir / "last.pt")
+        if patience > 0 and bad_epochs >= patience:
+            print(
+                f"Early stopping at epoch {epoch}: no val improvement for {bad_epochs} epochs "
+                f"(best_epoch={best_epoch}, best_val_loss={best_val:.4f})"
+            )
+            break
 
     if test_loader is not None:
         best_model = build_model(cfg, input_dim=input_dim).to(device)
@@ -553,12 +578,14 @@ def main():
         last_model.load_state_dict(torch.load(save_dir / "last.pt", map_location=device))
         last_test_loss = evaluate(last_model, test_loader, device)
 
-        print(f"Test | best_loss {best_test_loss:.4f} | last_loss {last_test_loss:.4f}")
+        print(f"Test | best_loss {best_test_loss:.4f} | last_loss {last_test_loss:.4f} | best_epoch {best_epoch}")
         with (save_dir / "test_metrics.yaml").open("w") as f:
             yaml.safe_dump(
                 {
                     "best_test_loss": float(best_test_loss),
                     "last_test_loss": float(last_test_loss),
+                    "best_epoch": int(best_epoch),
+                    "best_val_loss": float(best_val),
                     "test_pieces": split_summary["test_pieces"],
                 },
                 f,

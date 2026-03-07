@@ -43,7 +43,7 @@ training:
   lr: 5.0e-4
   weight_decay: 0.01
   grad_clip: 1.0
-  loss_type: mse             # mse|bce|huber ; mse is the default for continuous salience
+  loss_type: huber             # mse|bce|huber ; mse is the default for continuous salience
   pos_weight: null
   device: auto
   seed: 42

@@ -28,14 +28,14 @@ data:
 
 model:
   input_dim: 6                 # 6 base features only
-  d_model: 128
+  d_model: 64
   nhead: 2
-  num_layers: 2
-  dim_feedforward: 512
+  num_layers: 1
+  dim_feedforward: 256
   dropout: 0.1
   max_len: 512
   include_empty_beats: true
-  performer_cond: true
+  performer_cond: false
   performer_emb_dim: 32
 
 training:

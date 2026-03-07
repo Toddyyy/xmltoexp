@@ -20,5 +20,5 @@ python train_beat_salience.py \
   --aux_mode heldout_pianists \
   --aux_targets Ashkenazy,Cohen \
   --levels 1,2,3,4,5 \
-  --level_weights 3,6,12,24,48 \
+  --level_weights 2.158,3.505,5.692,9.243,15.012 \
   --device cuda

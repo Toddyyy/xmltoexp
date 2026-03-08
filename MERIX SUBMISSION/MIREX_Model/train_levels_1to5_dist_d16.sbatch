@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=beat_L1to5
+#SBATCH --job-name=beat_L1to5_d16
 #SBATCH --partition=gpua800
 #SBATCH --gres=gpu:1
 #SBATCH --qos=1a800
@@ -18,7 +18,7 @@ trap 'rm -rf "$tmp_cfg_dir"' EXIT
 
 for level in 1 2 3 4 5; do
   base_cfg="config_beat_mazurka_level${level}.yaml"
-  run_cfg="${tmp_cfg_dir}/config_beat_mazurka_level${level}_feat14_pcond.yaml"
+  run_cfg="${tmp_cfg_dir}/config_beat_mazurka_level${level}_feat14_pcond_d16.yaml"
 
   python - "$base_cfg" "$run_cfg" <<'PY'
 import sys
@@ -31,6 +31,10 @@ with open(src, "r", encoding="utf-8") as f:
 cfg["data"]["use_base_features_only"] = False
 cfg["model"]["input_dim"] = 14
 cfg["model"]["performer_cond"] = True
+cfg["model"]["d_model"] = 16
+cfg["model"]["nhead"] = 1
+cfg["model"]["dim_feedforward"] = 64
+cfg["model"]["num_layers"] = 1
 
 with open(dst, "w", encoding="utf-8") as f:
     yaml.safe_dump(cfg, f, sort_keys=False)

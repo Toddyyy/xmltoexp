@@ -1,13 +1,12 @@
 data:
   data_dir: beat_data_mazurka_performer_levels   # directory with *.npz (note_feats + beat_ids + boundary_probs)
   file_ext: npz
-  beat_sequence_length: 128      # set to int to slice by beats instead of notes
-  beat_stride: 64               # beat window stride (defaults to beat_sequence_length)
-
-  train_beat_sequence_length: 128
-  train_beat_stride: 64
-  eval_beat_sequence_length: 128
-  eval_beat_stride: 128
+  # set to int to slice by beats instead of notes
+  # beat window stride (defaults to beat_sequence_length)
+  train_beat_sequence_length: 256
+  train_beat_stride: 128
+  eval_beat_sequence_length: 256
+  eval_beat_stride: 256
   
   drop_short: false              # drop pieces shorter than sequence_length
   max_len: null                 # no note truncation in beat-slice mode

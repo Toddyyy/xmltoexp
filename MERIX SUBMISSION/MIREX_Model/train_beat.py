@@ -117,6 +117,24 @@ def recording_id_from_path(path: Path) -> str | None:
     return None
 
 
+def piece_id_from_path(path: Path, cfg) -> str:
+    stem = path.stem
+    regex = cfg.get("data", {}).get("piece_id_regex")
+    if regex:
+        m = re.search(regex, stem)
+        if not m and "\\\\" in regex:
+            try:
+                m = re.search(regex.encode("utf-8").decode("unicode_escape"), stem)
+            except Exception:
+                m = None
+        if m:
+            return m.group(1) if m.groups() else m.group(0)
+    delim = cfg.get("data", {}).get("piece_id_delim")
+    if delim and delim in stem:
+        return stem.split(delim)[0]
+    return stem
+
+
 def build_aux_filters(aux_data, aux_mode=None, aux_targets=None):
     if not aux_mode:
         return None
@@ -154,15 +172,24 @@ def build_aux_filters(aux_data, aux_mode=None, aux_targets=None):
     raise ValueError(f"Unsupported aux_mode: {aux_mode}")
 
 
-def create_dataloaders(cfg, level=None, split_file=None, aux_split_file=None, aux_mode=None, aux_targets=None):
-    dataset = BeatBoundaryDataset(
+def build_dataset(cfg, beat_sequence_length=None, beat_stride=None):
+    data_cfg = cfg["data"]
+    return BeatBoundaryDataset(
         data_dir=cfg["data"]["data_dir"],
         file_ext=cfg["data"]["file_ext"],
         max_len=cfg["data"]["max_len"],
         sequence_length=cfg["data"].get("sequence_length"),
         stride=cfg["data"].get("stride"),
-        beat_sequence_length=cfg["data"].get("beat_sequence_length"),
-        beat_stride=cfg["data"].get("beat_stride"),
+        beat_sequence_length=(
+            data_cfg.get("beat_sequence_length")
+            if beat_sequence_length is None
+            else beat_sequence_length
+        ),
+        beat_stride=(
+            data_cfg.get("beat_stride")
+            if beat_stride is None
+            else beat_stride
+        ),
         drop_short=cfg["data"].get("drop_short", True),
         position_mode=cfg["data"].get("position_mode", "absolute"),
         use_base_features_only=cfg["data"].get("use_base_features_only", False),
@@ -178,23 +205,8 @@ def create_dataloaders(cfg, level=None, split_file=None, aux_split_file=None, au
         label_binarize_threshold=cfg["data"].get("label_binarize_threshold"),
     )
 
-    def piece_id_from_path(path: Path) -> str:
-        stem = path.stem
-        regex = cfg.get("data", {}).get("piece_id_regex")
-        if regex:
-            m = re.search(regex, stem)
-            if not m and "\\\\" in regex:
-                try:
-                    m = re.search(regex.encode("utf-8").decode("unicode_escape"), stem)
-                except Exception:
-                    m = None
-            if m:
-                return m.group(1) if m.groups() else m.group(0)
-        delim = cfg.get("data", {}).get("piece_id_delim")
-        if delim and delim in stem:
-            return stem.split(delim)[0]
-        return stem
 
+def apply_dataset_filters(dataset, cfg, level=None, aux_split_file=None, aux_mode=None, aux_targets=None):
     if level is not None:
         level_tag = f"_L{int(level)}"
         filtered = [s for s in dataset.samples if Path(s["path"]).stem.endswith(level_tag)]
@@ -242,26 +254,85 @@ def create_dataloaders(cfg, level=None, split_file=None, aux_split_file=None, au
             raise ValueError("Auxiliary filtering removed all samples.")
         dataset.samples = filtered_samples
 
-    piece_ids = [piece_id_from_path(s["path"]) for s in dataset.samples]
-    unique_pieces = list({pid for pid in piece_ids})
+    return aux_summary
+
+
+def create_dataloaders(cfg, level=None, split_file=None, aux_split_file=None, aux_mode=None, aux_targets=None):
+    data_cfg = cfg["data"]
+    train_beat_sequence_length = data_cfg.get(
+        "train_beat_sequence_length",
+        data_cfg.get("beat_sequence_length"),
+    )
+    train_beat_stride = data_cfg.get(
+        "train_beat_stride",
+        data_cfg.get("beat_stride"),
+    )
+    eval_beat_sequence_length = data_cfg.get(
+        "eval_beat_sequence_length",
+        data_cfg.get("beat_sequence_length"),
+    )
+    eval_beat_stride = data_cfg.get(
+        "eval_beat_stride",
+        data_cfg.get("beat_stride"),
+    )
+
+    train_dataset = build_dataset(
+        cfg,
+        beat_sequence_length=train_beat_sequence_length,
+        beat_stride=train_beat_stride,
+    )
+    eval_dataset = build_dataset(
+        cfg,
+        beat_sequence_length=eval_beat_sequence_length,
+        beat_stride=eval_beat_stride,
+    )
+
+    aux_summary = apply_dataset_filters(
+        train_dataset,
+        cfg,
+        level=level,
+        aux_split_file=aux_split_file,
+        aux_mode=aux_mode,
+        aux_targets=aux_targets,
+    )
+    apply_dataset_filters(
+        eval_dataset,
+        cfg,
+        level=level,
+        aux_split_file=aux_split_file,
+        aux_mode=aux_mode,
+        aux_targets=aux_targets,
+    )
+
+    train_piece_ids = [piece_id_from_path(s["path"], cfg) for s in train_dataset.samples]
+    eval_piece_ids = [piece_id_from_path(s["path"], cfg) for s in eval_dataset.samples]
+    unique_pieces = list(set(train_piece_ids) | set(eval_piece_ids))
     split_meta = None
     if split_file:
         split_meta = load_piece_split(split_file)
-        known = set(unique_pieces)
-        requested = split_meta["train"] | split_meta["val"] | split_meta["test"]
-        missing = sorted(requested - known)
+        train_known = set(train_piece_ids)
+        eval_known = set(eval_piece_ids)
+        missing_train = sorted(split_meta["train"] - train_known)
+        missing_eval = sorted((split_meta["val"] | split_meta["test"]) - eval_known)
+        missing = sorted(set(missing_train) | set(missing_eval))
         if missing:
-            raise ValueError(f"Split file references pieces not found in dataset: {missing}")
-        train_indices = [i for i, pid in enumerate(piece_ids) if pid in split_meta["train"]]
-        val_indices = [i for i, pid in enumerate(piece_ids) if pid in split_meta["val"]]
-        test_indices = [i for i, pid in enumerate(piece_ids) if pid in split_meta["test"]]
-        train_ds = Subset(dataset, train_indices)
-        val_ds = Subset(dataset, val_indices)
-        test_ds = Subset(dataset, test_indices) if test_indices else None
+            raise ValueError(
+                "Split file references pieces not found in dataset: "
+                f"{missing}"
+            )
+        train_indices = [i for i, pid in enumerate(train_piece_ids) if pid in split_meta["train"]]
+        val_indices = [i for i, pid in enumerate(eval_piece_ids) if pid in split_meta["val"]]
+        test_indices = [i for i, pid in enumerate(eval_piece_ids) if pid in split_meta["test"]]
+        train_ds = Subset(train_dataset, train_indices)
+        val_ds = Subset(eval_dataset, val_indices)
+        test_ds = Subset(eval_dataset, test_indices) if test_indices else None
     elif len(unique_pieces) < 2:
-        train_ds = dataset
-        val_ds = dataset
+        train_ds = train_dataset
+        val_ds = eval_dataset
         test_ds = None
+        train_indices = list(range(len(train_dataset.samples)))
+        val_indices = list(range(len(eval_dataset.samples)))
+        test_indices = []
     else:
         rng = random.Random(cfg["training"]["seed"])
         rng.shuffle(unique_pieces)
@@ -270,12 +341,13 @@ def create_dataloaders(cfg, level=None, split_file=None, aux_split_file=None, au
         train_pieces = set(unique_pieces[:train_count])
         val_pieces = set(unique_pieces[train_count:])
 
-        train_indices = [i for i, pid in enumerate(piece_ids) if pid in train_pieces]
-        val_indices = [i for i, pid in enumerate(piece_ids) if pid in val_pieces]
+        train_indices = [i for i, pid in enumerate(train_piece_ids) if pid in train_pieces]
+        val_indices = [i for i, pid in enumerate(eval_piece_ids) if pid in val_pieces]
 
-        train_ds = Subset(dataset, train_indices)
-        val_ds = Subset(dataset, val_indices)
+        train_ds = Subset(train_dataset, train_indices)
+        val_ds = Subset(eval_dataset, val_indices)
         test_ds = None
+        test_indices = []
 
     pad_to = cfg["data"]["max_len"]
     collate_fn = lambda batch: collate_beat(batch, pad_to=pad_to)
@@ -308,12 +380,20 @@ def create_dataloaders(cfg, level=None, split_file=None, aux_split_file=None, au
         )
     split_summary = {
         "all_pieces": sorted(unique_pieces),
-        "train_pieces": sorted({piece_ids[i] for i in train_indices}) if isinstance(train_ds, Subset) else sorted(unique_pieces),
-        "val_pieces": sorted({piece_ids[i] for i in val_indices}) if isinstance(val_ds, Subset) else sorted(unique_pieces),
-        "test_pieces": sorted({piece_ids[i] for i in test_indices}) if split_meta and split_meta["test"] else [],
+        "train_pieces": sorted({train_piece_ids[i] for i in train_indices}),
+        "val_pieces": sorted({eval_piece_ids[i] for i in val_indices}),
+        "test_pieces": sorted({eval_piece_ids[i] for i in test_indices}) if split_meta and split_meta["test"] else [],
         "aux_filter": aux_summary,
+        "train_window": {
+            "beat_sequence_length": train_beat_sequence_length,
+            "beat_stride": train_beat_stride,
+        },
+        "eval_window": {
+            "beat_sequence_length": eval_beat_sequence_length,
+            "beat_stride": eval_beat_stride,
+        },
     }
-    return train_loader, val_loader, test_loader, dataset.feature_dim, dataset, split_summary
+    return train_loader, val_loader, test_loader, train_dataset.feature_dim, train_dataset, split_summary
 
 
 def build_model(cfg, input_dim):

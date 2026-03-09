@@ -1,8 +1,12 @@
 data:
   data_dir: beat_data_mazurka_performer_levels
   file_ext: npz
-  beat_sequence_length: 128
-  beat_stride: 128
+  # set to int to slice by beats instead of notes
+  # beat window stride (defaults to beat_sequence_length)
+  train_beat_sequence_length: 128
+  train_beat_stride: 64
+  eval_beat_sequence_length: 128
+  eval_beat_stride: 128
   drop_short: true
   max_len: null
   position_mode: zero
@@ -54,7 +58,7 @@ training:
   weight_decay: 0.01
   grad_clip: 1.0
   loss_type: bce
-  pos_weight: 8.9
+  pos_weight: 3.846845
   device: auto
   seed: 42
   freeze_base: false

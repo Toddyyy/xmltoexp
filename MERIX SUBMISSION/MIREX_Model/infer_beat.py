@@ -42,6 +42,7 @@ def build_model(cfg, input_dim: int) -> BeatBoundaryModel:
     model_cfg = BeatBoundaryConfig(
         input_dim=input_dim,
         d_model=cfg["model"]["d_model"],
+        beat_encoder_type=cfg["model"].get("beat_encoder_type", "transformer"),
         nhead=cfg["model"]["nhead"],
         num_layers=cfg["model"]["num_layers"],
         dim_feedforward=cfg["model"]["dim_feedforward"],
@@ -53,6 +54,9 @@ def build_model(cfg, input_dim: int) -> BeatBoundaryModel:
         note_rnn_hidden=cfg["model"].get("note_rnn_hidden"),
         note_rnn_layers=cfg["model"].get("note_rnn_layers", 1),
         note_rnn_dropout=cfg["model"].get("note_rnn_dropout", cfg["model"]["dropout"]),
+        beat_rnn_hidden=cfg["model"].get("beat_rnn_hidden"),
+        beat_rnn_layers=cfg["model"].get("beat_rnn_layers", cfg["model"]["num_layers"]),
+        beat_rnn_dropout=cfg["model"].get("beat_rnn_dropout", cfg["model"]["dropout"]),
         performer_cond=cfg["model"].get("performer_cond", False),
         performer_emb_dim=cfg["model"].get("performer_emb_dim", 32),
         performer_vocab_size=cfg["model"].get("performer_vocab_size", 0),

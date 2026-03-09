@@ -1,0 +1,31 @@
+config: /tmp/tmp.ynnGwr24n0/config_beat_mazurka_level3_feat14_pcond_bilstm_noaux.yaml
+model_path: /gpfs/work/int/yuxuanliu2204/Changheng/xmltoexp/MERIX SUBMISSION/MIREX_Model/check/beat_mazurka/level_3/beat_mazurka_bilstm_noaux_L3_20260309_184133/best.pt
+split_file: /gpfs/work/int/yuxuanliu2204/Changheng/xmltoexp/MERIX SUBMISSION/MIREX_Model/splits/mazurka_piece_split_v1.yaml
+level: 3
+split: test
+num_files: 392
+window_beats: 128
+window_stride: 128
+tolerance: 2
+head: dist
+pred_peak_params:
+  min_dist: 6
+  height: 0.15
+  prominence: 0.05
+true_peak_params:
+  binary_threshold: 0.5
+  min_dist: 6
+  height: 0.15
+  prominence: 0.05
+micro:
+  tp: 4461
+  fp: 6559
+  fn: 4578
+  precision: 0.4048094373865699
+  recall: 0.49352804513773646
+  f1: 0.4447878757664888
+macro:
+  precision: 0.40170808600151764
+  recall: 0.5010545339133089
+  f1: 0.4425137528406519
+per_file_csv: /gpfs/work/int/yuxuanliu2204/Changheng/xmltoexp/MERIX SUBMISSION/MIREX_Model/check/beat_mazurka/level_3/beat_mazurka_bilstm_noaux_L3_20260309_184133/boundary_eval_test_L3/per_file_metrics.csv

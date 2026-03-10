@@ -97,6 +97,7 @@ class BeatBoundaryDataset(Dataset):
             )
         self.performer_map = self._build_performer_map()
         self.num_performers = len(self.performer_map)
+        self._sampling_meta_cache: Dict[Path, Dict[str, np.ndarray]] = {}
 
         # Peek to infer feature dimension
         first = self._load_file(self.files[0])
@@ -286,6 +287,57 @@ class BeatBoundaryDataset(Dataset):
                 "No beat samples built. Check beat_sequence_length/beat_stride or set drop_short=False."
             )
         return samples
+
+    def _load_sampling_meta(self, path: Path) -> Dict[str, np.ndarray]:
+        cached = self._sampling_meta_cache.get(path)
+        if cached is not None:
+            return cached
+
+        if self.file_ext == "npz":
+            with np.load(path, mmap_mode="r") as data:
+                beat_ids = np.asarray(data["beat_ids"])
+                boundary = np.asarray(data["boundary_probs"], dtype=np.float32)
+        elif self.file_ext == "pt":
+            data = torch.load(path, map_location="cpu")
+            beat_ids = data["beat_ids"].numpy() if isinstance(data["beat_ids"], torch.Tensor) else np.asarray(data["beat_ids"])
+            raw_boundary = data["boundary_probs"].numpy() if isinstance(data["boundary_probs"], torch.Tensor) else data["boundary_probs"]
+            boundary = np.asarray(raw_boundary, dtype=np.float32)
+        else:
+            raise ValueError(f"Unsupported file_ext: {self.file_ext}")
+
+        out = {"beat_ids": beat_ids, "boundary_probs": boundary}
+        self._sampling_meta_cache[path] = out
+        return out
+
+    def sample_boundary_stats(self, idx: int, threshold: float = 0.0) -> Dict[str, int]:
+        sample = self.samples[idx]
+        meta = self._load_sampling_meta(sample["path"])
+        beat_ids = meta["beat_ids"]
+        labels_ratio = meta["boundary_probs"]
+
+        beat_start = sample.get("beat_start")
+        if beat_start is not None:
+            beat_start = max(int(beat_start), 0)
+            beat_end = min(int(sample["beat_end"]), int(labels_ratio.shape[0]))
+            window = labels_ratio[beat_start:beat_end]
+        elif sample["start"] is not None:
+            beat_ids_win = beat_ids[sample["start"] : sample["end"]]
+            valid = beat_ids_win >= 0
+            if np.any(valid):
+                bmin = int(np.min(beat_ids_win[valid]))
+                bmax = int(np.max(beat_ids_win[valid]))
+                window = labels_ratio[bmin : bmax + 1]
+            else:
+                window = labels_ratio[:0]
+        else:
+            window = labels_ratio
+
+        pos_count = int((window > float(threshold)).sum())
+        return {
+            "num_beats": int(window.shape[0]),
+            "pos_count": pos_count,
+            "has_boundary": int(pos_count > 0),
+        }
 
     def _load_file(self, path: Path) -> Dict[str, Any]:
         if self.file_ext == "npz":

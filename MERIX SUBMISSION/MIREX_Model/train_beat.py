@@ -6,7 +6,7 @@ from datetime import datetime
 from pathlib import Path
 
 import torch
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
 import yaml
 
 from dataset_beat import BeatBoundaryDataset, collate_beat
@@ -349,13 +349,66 @@ def create_dataloaders(cfg, level=None, split_file=None, aux_split_file=None, au
         test_ds = None
         test_indices = []
 
+    sampler_meta = {
+        "mode": None,
+        "boundary_windows": 0,
+        "background_windows": 0,
+        "boundary_window_weight": None,
+        "background_window_weight": None,
+        "boundary_window_threshold": None,
+    }
+    train_sampler = None
+    sampler_mode = cfg.get("training", {}).get("train_sampler")
+    if sampler_mode in {None, "", "uniform"}:
+        sampler_mode = None
+    elif sampler_mode != "boundary_window":
+        raise ValueError("training.train_sampler must be one of: uniform, boundary_window")
+    if sampler_mode == "boundary_window":
+        if isinstance(train_ds, Subset):
+            base_dataset = train_ds.dataset
+            base_indices = list(train_ds.indices)
+        else:
+            base_dataset = train_ds
+            base_indices = list(range(len(train_ds)))
+
+        boundary_window_weight = float(cfg["training"].get("boundary_window_weight", 4.0))
+        background_window_weight = float(cfg["training"].get("background_window_weight", 1.0))
+        boundary_window_threshold = float(cfg["training"].get("boundary_window_threshold", 0.0))
+
+        sample_weights = []
+        boundary_windows = 0
+        background_windows = 0
+        for base_idx in base_indices:
+            stats = base_dataset.sample_boundary_stats(base_idx, threshold=boundary_window_threshold)
+            if stats["has_boundary"]:
+                sample_weights.append(boundary_window_weight)
+                boundary_windows += 1
+            else:
+                sample_weights.append(background_window_weight)
+                background_windows += 1
+
+        train_sampler = WeightedRandomSampler(
+            weights=torch.tensor(sample_weights, dtype=torch.double),
+            num_samples=len(sample_weights),
+            replacement=True,
+        )
+        sampler_meta = {
+            "mode": sampler_mode,
+            "boundary_windows": boundary_windows,
+            "background_windows": background_windows,
+            "boundary_window_weight": boundary_window_weight,
+            "background_window_weight": background_window_weight,
+            "boundary_window_threshold": boundary_window_threshold,
+        }
+
     pad_to = cfg["data"]["max_len"]
     collate_fn = lambda batch: collate_beat(batch, pad_to=pad_to)
 
     train_loader = DataLoader(
         train_ds,
         batch_size=cfg["data"]["batch_size"],
-        shuffle=True,
+        shuffle=train_sampler is None,
+        sampler=train_sampler,
         num_workers=cfg["data"]["num_workers"],
         collate_fn=collate_fn,
         pin_memory=True,
@@ -384,6 +437,7 @@ def create_dataloaders(cfg, level=None, split_file=None, aux_split_file=None, au
         "val_pieces": sorted({eval_piece_ids[i] for i in val_indices}),
         "test_pieces": sorted({eval_piece_ids[i] for i in test_indices}) if split_meta and split_meta["test"] else [],
         "aux_filter": aux_summary,
+        "train_sampler": sampler_meta,
         "train_window": {
             "beat_sequence_length": train_beat_sequence_length,
             "beat_stride": train_beat_stride,

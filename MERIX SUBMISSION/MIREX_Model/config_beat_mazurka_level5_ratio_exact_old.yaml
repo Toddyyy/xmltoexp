@@ -1,0 +1,55 @@
+data:
+  data_dir: beat_data_mazurka_performer_levels   # closest currently available multi-level dataset
+  file_ext: npz
+  beat_sequence_length: 256
+  beat_stride: 256
+  drop_short: true
+  max_len: null
+  position_mode: zero
+  use_base_features_only: true
+  label_mode: ratio
+  dist_min_dist: 6
+  dist_height: 0.15
+  dist_prominence: 0.05
+  dist_tau: 4.0
+  train_split: 0.8
+  batch_size: 4
+  num_workers: 0
+  value_ranges:
+    pitch_midi: [0.0, 127.0]
+    duration: [0.0, 8.0]
+    position: [0.0, 1.0]
+    part_idx: [0.0, 7.0]
+    is_accent: [0.0, 1.0]
+    is_staccato: [0.0, 1.0]
+  label_binarize_threshold: null
+  piece_id_regex: '^(M\\d+-\\d+)'
+  performer_id_regex: '(pid[^_]+)'
+
+model:
+  input_dim: 6
+  d_model: 128
+  nhead: 2
+  num_layers: 2
+  dim_feedforward: 512
+  dropout: 0.1
+  max_len: 512
+  include_empty_beats: true
+  performer_cond: false
+  performer_emb_dim: 32
+
+training:
+  epochs: 50
+  lr: 5.0e-4
+  weight_decay: 0.01
+  grad_clip: 1.0
+  loss_type: bce
+  pos_weight: 94.942799
+  device: auto
+  seed: 42
+  freeze_base: false
+
+trainer:
+  save_dir: ./check/beat_mazurka
+  experiment_name: beat_mazurka_L5_ratio_exact_old
+  eval_every: 1

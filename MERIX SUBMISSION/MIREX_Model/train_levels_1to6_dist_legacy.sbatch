@@ -24,12 +24,14 @@ for level in 1 2 3 4 5 6; do
     python train_beat.py \
       --config "$cfg" \
       --level "$level" \
+      --early_stop_patience 5 \
       --pos_weight 239.6 \
       --device cuda
   else
     python train_beat.py \
       --config "$cfg" \
       --level "$level" \
+      --early_stop_patience 5 \
       --device cuda
   fi
 done

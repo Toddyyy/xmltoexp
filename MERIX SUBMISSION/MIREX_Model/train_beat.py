@@ -286,6 +286,18 @@ def main():
     )
     parser.add_argument("--level", type=int, default=None, help="Use only samples with suffix _L{level}.npz")
     parser.add_argument("--pos_weight", type=float, default=None, help="Override training.pos_weight")
+    parser.add_argument(
+        "--early_stop_patience",
+        type=int,
+        default=0,
+        help="Stop if val loss does not improve for N epochs (0 disables early stopping)",
+    )
+    parser.add_argument(
+        "--early_stop_min_delta",
+        type=float,
+        default=0.0,
+        help="Minimum val loss improvement required to reset early stopping",
+    )
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -356,16 +368,31 @@ def main():
     best_val = float("inf")
     epochs = cfg["training"]["epochs"]
     grad_clip = cfg["training"].get("grad_clip", None)
+    patience = max(0, int(args.early_stop_patience))
+    min_delta = float(args.early_stop_min_delta)
+    bad_epochs = 0
+    best_epoch = 0
 
     for epoch in range(1, epochs + 1):
         train_loss = train_one_epoch(model, train_loader, optimizer, device, grad_clip)
         val_loss = evaluate(model, val_loader, device)
         print(f"Epoch {epoch}/{epochs} | train_loss {train_loss:.4f} | val_loss {val_loss:.4f}")
 
-        if val_loss < best_val:
+        if val_loss < (best_val - min_delta):
             best_val = val_loss
+            best_epoch = epoch
+            bad_epochs = 0
             torch.save(model.state_dict(), save_dir / "best.pt")
+        else:
+            bad_epochs += 1
         torch.save(model.state_dict(), save_dir / "last.pt")
+
+        if patience > 0 and bad_epochs >= patience:
+            print(
+                f"Early stopping at epoch {epoch}: no val improvement for {bad_epochs} epochs "
+                f"(best_epoch={best_epoch}, best_val_loss={best_val:.4f})"
+            )
+            break
 
 
 if __name__ == "__main__":

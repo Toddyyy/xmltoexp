@@ -54,7 +54,6 @@ class PositionalEncoding(nn.Module):
 class BeatBoundaryConfig:
     input_dim: int = 64
     d_model: int = 256
-    beat_encoder_type: str = "transformer"
     nhead: int = 4
     num_layers: int = 4
     dim_feedforward: int = 512
@@ -66,9 +65,6 @@ class BeatBoundaryConfig:
     note_rnn_hidden: Optional[int] = None
     note_rnn_layers: int = 1
     note_rnn_dropout: float = 0.0
-    beat_rnn_hidden: Optional[int] = None
-    beat_rnn_layers: int = 1
-    beat_rnn_dropout: float = 0.0
     performer_cond: bool = False
     performer_emb_dim: int = 32
     performer_vocab_size: int = 0
@@ -97,7 +93,6 @@ class BeatBoundaryModel(nn.Module):
         self.prob_pos_weight = prob_pos_weight if prob_pos_weight is not None else pos_weight
         self.prob_loss_weight = float(prob_loss_weight)
         self.performer_cond = bool(config.performer_cond)
-        self.beat_encoder_type = str(config.beat_encoder_type).lower()
         rnn_hidden = config.note_rnn_hidden
         if rnn_hidden is None:
             rnn_hidden = max(1, config.d_model // 2)
@@ -109,41 +104,16 @@ class BeatBoundaryModel(nn.Module):
             dropout=config.note_rnn_dropout,
             out_dim=config.d_model,
         )
-        self.beat_pos_enc = None
-        self.beat_encoder = None
-        self.beat_rnn = None
-        self.beat_rnn_proj = None
-        self.beat_rnn_drop = None
-        if self.beat_encoder_type == "transformer":
-            self.beat_pos_enc = PositionalEncoding(config.d_model, dropout=config.dropout, max_len=config.max_len)
-            encoder_layer = nn.TransformerEncoderLayer(
-                d_model=config.d_model,
-                nhead=config.nhead,
-                dim_feedforward=config.dim_feedforward,
-                dropout=config.dropout,
-                batch_first=True,
-            )
-            self.beat_encoder = nn.TransformerEncoder(encoder_layer, num_layers=config.num_layers)
-        elif self.beat_encoder_type == "bilstm":
-            beat_rnn_hidden = config.beat_rnn_hidden
-            if beat_rnn_hidden is None:
-                beat_rnn_hidden = max(1, config.d_model // 2)
-            beat_rnn_dropout = config.beat_rnn_dropout if config.beat_rnn_layers > 1 else 0.0
-            self.beat_rnn = nn.LSTM(
-                input_size=config.d_model,
-                hidden_size=int(beat_rnn_hidden),
-                num_layers=int(config.beat_rnn_layers),
-                dropout=float(beat_rnn_dropout),
-                batch_first=True,
-                bidirectional=True,
-            )
-            out_dim = int(beat_rnn_hidden) * 2
-            self.beat_rnn_proj = nn.Identity() if out_dim == config.d_model else nn.Linear(out_dim, config.d_model)
-            self.beat_rnn_drop = nn.Dropout(config.dropout)
-        else:
-            raise ValueError(
-                f"Unsupported beat_encoder_type: {config.beat_encoder_type}. Use 'transformer' or 'bilstm'."
-            )
+        self.beat_pos_enc = PositionalEncoding(config.d_model, dropout=config.dropout, max_len=config.max_len)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=config.d_model,
+            nhead=config.nhead,
+            dim_feedforward=config.dim_feedforward,
+            dropout=config.dropout,
+            batch_first=True,
+        )
+        self.beat_encoder = nn.TransformerEncoder(encoder_layer, num_layers=config.num_layers)
         self.head = nn.Linear(config.d_model, 1)
         self.performer_emb = None
         self.performer_proj = None
@@ -242,28 +212,9 @@ class BeatBoundaryModel(nn.Module):
             else:
                 attn_mask_beats = beat_valid & beat_mask
 
-        if self.beat_encoder_type == "transformer":
-            x = self.beat_pos_enc(beat_emb)
-            beat_key_padding = ~attn_mask_beats.bool() if attn_mask_beats is not None else None
-            enc = self.beat_encoder(x, src_key_padding_mask=beat_key_padding)  # [B, beats, d_model]
-        else:
-            lengths = attn_mask_beats.long().sum(dim=1)
-            safe_lengths = lengths.clamp(min=1).cpu()
-            packed = nn.utils.rnn.pack_padded_sequence(
-                beat_emb,
-                safe_lengths,
-                batch_first=True,
-                enforce_sorted=False,
-            )
-            packed_out, _ = self.beat_rnn(packed)
-            enc, _ = nn.utils.rnn.pad_packed_sequence(
-                packed_out,
-                batch_first=True,
-                total_length=max_beats,
-            )
-            enc = self.beat_rnn_proj(enc)
-            enc = self.beat_rnn_drop(enc)
-            enc = enc * attn_mask_beats.unsqueeze(-1).to(enc.dtype)
+        x = self.beat_pos_enc(beat_emb)
+        beat_key_padding = ~attn_mask_beats.bool() if attn_mask_beats is not None else None
+        enc = self.beat_encoder(x, src_key_padding_mask=beat_key_padding)  # [B, beats, d_model]
         logits_dist = self.head(enc).squeeze(-1)  # [B, beats]
         logits_prob = None
         if self.dual_head:

@@ -69,21 +69,6 @@ def extract_score_tokens(xml_path: Path, expand_repeats: bool = False) -> Tuple[
 
             duration = float(el.quarterLength)
             tie = str(el.tie.type) if getattr(el, "tie", None) else None
-            measure = el.getContextByClass(music21.stream.Measure)
-            measure_number = int(measure.number) if measure is not None and measure.number is not None else None
-            measure_length = None
-            measure_progress = None
-            if measure is not None:
-                try:
-                    measure_length = float(measure.barDuration.quarterLength)
-                except Exception:
-                    measure_length = None
-                try:
-                    measure_offset = float(el.getOffsetBySite(measure))
-                except Exception:
-                    measure_offset = float(el.offset)
-                if measure_length and measure_length > 0:
-                    measure_progress = max(0.0, min(measure_offset / measure_length, 1.0))
 
             articulations = [type(a).__name__.lower() for a in el.articulations]
             is_accent = any("accent" in a for a in articulations)
@@ -105,8 +90,6 @@ def extract_score_tokens(xml_path: Path, expand_repeats: bool = False) -> Tuple[
                     "pitch_midi": int(pitch.midi),
                     "part_id": part_id,
                     "part_idx": part_idx,
-                    "measure_number": measure_number,
-                    "measure_progress": measure_progress,
                     "tie": tie,
                     "is_accent": is_accent,
                     "is_staccato": is_staccato,

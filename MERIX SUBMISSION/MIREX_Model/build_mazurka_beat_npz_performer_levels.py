@@ -6,7 +6,6 @@ import numpy as np
 import pandas as pd
 from scipy.signal import find_peaks
 
-from beat_feature_utils import build_selected_score_beat_features
 from tokenizer_beat import extract_score_tokens, build_note_features
 
 
@@ -167,6 +166,61 @@ def boundaries_to_mask(n_beats, boundary_indices):
     return mask
 
 
+def build_score_beat_features(note_feats: np.ndarray, beat_ids: np.ndarray, num_beats: int) -> np.ndarray:
+    feats = np.zeros((num_beats, 6), dtype=np.float32)
+    if num_beats <= 0 or note_feats.size == 0:
+        return feats
+
+    valid = (beat_ids >= 0) & (beat_ids < num_beats)
+    if not np.any(valid):
+        return feats
+
+    b = beat_ids[valid]
+    f = note_feats[valid]
+
+    counts = np.zeros(num_beats, dtype=np.float32)
+    sum_pitch = np.zeros(num_beats, dtype=np.float32)
+    sum_dur = np.zeros(num_beats, dtype=np.float32)
+    sum_acc = np.zeros(num_beats, dtype=np.float32)
+    sum_stc = np.zeros(num_beats, dtype=np.float32)
+    min_pitch = np.full(num_beats, np.inf, dtype=np.float32)
+    max_pitch = np.full(num_beats, -np.inf, dtype=np.float32)
+
+    np.add.at(counts, b, 1.0)
+    np.add.at(sum_pitch, b, f[:, 0])
+    np.add.at(sum_dur, b, f[:, 1])
+    np.add.at(sum_acc, b, f[:, 4])
+    np.add.at(sum_stc, b, f[:, 5])
+    np.minimum.at(min_pitch, b, f[:, 0])
+    np.maximum.at(max_pitch, b, f[:, 0])
+
+    mean_pitch = np.divide(sum_pitch, counts, out=np.zeros_like(sum_pitch), where=counts > 0)
+    mean_dur = np.divide(sum_dur, counts, out=np.zeros_like(sum_dur), where=counts > 0)
+    acc_ratio = np.divide(sum_acc, counts, out=np.zeros_like(sum_acc), where=counts > 0)
+    stc_ratio = np.divide(sum_stc, counts, out=np.zeros_like(sum_stc), where=counts > 0)
+
+    pitch_range = np.where(counts > 0, max_pitch - min_pitch, 0.0)
+    max_count = float(counts.max()) if counts.size > 0 else 1.0
+
+    count_norm = counts / max(max_count, 1.0)
+    mean_pitch_norm = mean_pitch / 127.0
+    pitch_range_norm = pitch_range / 127.0
+    mean_dur_norm = mean_dur / 8.0
+
+    feats = np.stack(
+        [
+            np.clip(count_norm, 0.0, 1.0),
+            np.clip(mean_pitch_norm, 0.0, 1.0),
+            np.clip(pitch_range_norm, 0.0, 1.0),
+            np.clip(mean_dur_norm, 0.0, 1.0),
+            np.clip(acc_ratio, 0.0, 1.0),
+            np.clip(stc_ratio, 0.0, 1.0),
+        ],
+        axis=1,
+    ).astype(np.float32)
+    return feats
+
+
 def parse_ws_list(text: str) -> list[int]:
     parts = [p.strip() for p in text.split(",") if p.strip()]
     return [int(p) for p in parts]
@@ -204,8 +258,8 @@ def main():
     )
     parser.add_argument(
         "--str_vec",
-        default="3,2,2,2,2",
-        help="Comma-separated hierarchy strides per level (default: 3,2,2,2,2).",
+        default="3,2,2,2,2,2",
+        help="Comma-separated hierarchy strides per level (default: 3,2,2,2,2,2).",
     )
     parser.add_argument(
         "--smooth_window",
@@ -279,7 +333,7 @@ def main():
     csv_dir.mkdir(parents=True, exist_ok=True)
     str_vec = parse_ws_list(args.str_vec)
     if not str_vec:
-        raise ValueError("str_vec is empty; provide --str_vec like '3,2,2,2,2'.")
+        raise ValueError("str_vec is empty; provide --str_vec like '3,2,2,2,2,2'.")
 
     xml_map = build_xml_map(xml_dir)
 
@@ -330,13 +384,7 @@ def main():
 
         append_beat_features = args.append_beat_features and not args.no_append_beat_features
         if append_beat_features:
-            beat_feats = build_selected_score_beat_features(
-                tokens=tokens,
-                note_feats=note_feats,
-                beat_ids=beat_ids,
-                num_beats=num_beats,
-                beat_unit=args.beat_unit,
-            )
+            beat_feats = build_score_beat_features(note_feats, beat_ids, num_beats)
             beat_ids_safe = np.clip(beat_ids, 0, num_beats - 1)
             note_feats = np.concatenate([note_feats, beat_feats[beat_ids_safe]], axis=1)
 

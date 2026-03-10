@@ -1,8 +1,8 @@
 #!/bin/bash
 #SBATCH --job-name=beat_salience_ratio
-#SBATCH --partition=gpua800
+#SBATCH --partition=gpu3090
 #SBATCH --gres=gpu:1
-#SBATCH --qos=1a800
+#SBATCH --qos=1gpu
 #SBATCH --output=slurm-%j.out
 #SBATCH --error=slurm-%j.err
 #SBATCH --time=24:00:00

@@ -16,5 +16,5 @@ source .venv/bin/activate
 python train_beat.py \
   --config config_beat_mazurka_level5_exact_old.yaml \
   --level 5 \
-  --early_stop_patience 0 \
+  --early_stop_patience 5 \
   --device cuda

@@ -78,7 +78,7 @@ def set_bias_only(model):
     return [p for p in model.parameters() if p.requires_grad]
 
 
-def create_dataloaders(cfg, level=None):
+def create_dataloaders(cfg, level=None, split_file=None):
     dataset = BeatBoundaryDataset(
         data_dir=cfg["data"]["data_dir"],
         file_ext=cfg["data"]["file_ext"],
@@ -106,12 +106,21 @@ def create_dataloaders(cfg, level=None):
         stem = path.stem
         regex = cfg.get("data", {}).get("piece_id_regex")
         if regex:
-            m = re.search(regex, stem)
-            if m:
-                return m.group(1) if m.groups() else m.group(0)
+            patterns = [regex]
+            if "\\\\" in regex:
+                try:
+                    patterns.append(regex.encode("utf-8").decode("unicode_escape"))
+                except UnicodeDecodeError:
+                    pass
+            for pattern in patterns:
+                m = re.search(pattern, stem)
+                if m:
+                    return m.group(1) if m.groups() else m.group(0)
         delim = cfg.get("data", {}).get("piece_id_delim")
         if delim and delim in stem:
             return stem.split(delim)[0]
+        if "_" in stem:
+            return stem.split("_")[0]
         return stem
 
     if level is not None:
@@ -122,10 +131,46 @@ def create_dataloaders(cfg, level=None):
         dataset.samples = filtered
 
     piece_ids = [piece_id_from_path(s["path"]) for s in dataset.samples]
-    unique_pieces = list({pid for pid in piece_ids})
-    if len(unique_pieces) < 2:
+    unique_pieces = sorted({pid for pid in piece_ids})
+    split_summary = {}
+
+    if split_file is not None:
+        with open(split_file, "r") as f:
+            split_cfg = yaml.safe_load(f) or {}
+        train_pieces = set(split_cfg.get("train", []))
+        val_pieces = set(split_cfg.get("val", []))
+        test_pieces = set(split_cfg.get("test", []))
+        known = set(unique_pieces)
+        missing = sorted((train_pieces | val_pieces | test_pieces) - known)
+        if missing:
+            raise ValueError(f"Split file references pieces not found in dataset: {missing}")
+        train_indices = [i for i, pid in enumerate(piece_ids) if pid in train_pieces]
+        val_indices = [i for i, pid in enumerate(piece_ids) if pid in val_pieces]
+        test_indices = [i for i, pid in enumerate(piece_ids) if pid in test_pieces]
+        if not train_indices:
+            raise ValueError("Split file produced empty train set")
+        if not val_indices:
+            raise ValueError("Split file produced empty val set")
+        train_ds = Subset(dataset, train_indices)
+        val_ds = Subset(dataset, val_indices)
+        test_ds = Subset(dataset, test_indices) if test_indices else None
+        split_summary = {
+            "mode": "split_file",
+            "split_file": str(split_file),
+            "train_pieces": sorted(train_pieces),
+            "val_pieces": sorted(val_pieces),
+            "test_pieces": sorted(test_pieces),
+        }
+    elif len(unique_pieces) < 2:
         train_ds = dataset
         val_ds = dataset
+        test_ds = None
+        split_summary = {
+            "mode": "degenerate",
+            "train_pieces": unique_pieces,
+            "val_pieces": unique_pieces,
+            "test_pieces": [],
+        }
     else:
         rng = random.Random(cfg["training"]["seed"])
         rng.shuffle(unique_pieces)
@@ -139,6 +184,14 @@ def create_dataloaders(cfg, level=None):
 
         train_ds = Subset(dataset, train_indices)
         val_ds = Subset(dataset, val_indices)
+        test_ds = None
+        split_summary = {
+            "mode": "random_piece_split",
+            "seed": int(cfg["training"]["seed"]),
+            "train_pieces": sorted(train_pieces),
+            "val_pieces": sorted(val_pieces),
+            "test_pieces": [],
+        }
 
     pad_to = cfg["data"]["max_len"]
     collate_fn = lambda batch: collate_beat(batch, pad_to=pad_to)
@@ -159,7 +212,17 @@ def create_dataloaders(cfg, level=None):
         collate_fn=collate_fn,
         pin_memory=True,
     )
-    return train_loader, val_loader, dataset.feature_dim, dataset
+    test_loader = None
+    if test_ds is not None:
+        test_loader = DataLoader(
+            test_ds,
+            batch_size=cfg["data"]["batch_size"],
+            shuffle=False,
+            num_workers=cfg["data"]["num_workers"],
+            collate_fn=collate_fn,
+            pin_memory=True,
+        )
+    return train_loader, val_loader, test_loader, dataset.feature_dim, dataset, split_summary
 
 
 def build_model(cfg, input_dim):
@@ -286,6 +349,7 @@ def main():
     )
     parser.add_argument("--level", type=int, default=None, help="Use only samples with suffix _L{level}.npz")
     parser.add_argument("--pos_weight", type=float, default=None, help="Override training.pos_weight")
+    parser.add_argument("--split_file", default=None, help="Optional YAML file with fixed train/val/test piece split")
     parser.add_argument(
         "--early_stop_patience",
         type=int,
@@ -316,7 +380,11 @@ def main():
 
     set_seed(cfg["training"]["seed"])
 
-    train_loader, val_loader, input_dim, dataset = create_dataloaders(cfg, level=args.level)
+    train_loader, val_loader, test_loader, input_dim, dataset, split_summary = create_dataloaders(
+        cfg,
+        level=args.level,
+        split_file=args.split_file,
+    )
     if args.sanity_batch:
         batch = next(iter(train_loader))
         print_batch_sanity(batch)
@@ -361,6 +429,8 @@ def main():
         base_save_dir = base_save_dir / f"level_{args.level}"
     save_dir = base_save_dir / exp_name
     save_dir.mkdir(parents=True, exist_ok=True)
+    with (save_dir / "split_summary.yaml").open("w") as f:
+        yaml.safe_dump(split_summary, f, sort_keys=False)
     if cfg.get("model", {}).get("performer_cond") and getattr(dataset, "performer_map", None):
         with (save_dir / "performer_map.yaml").open("w") as f:
             yaml.safe_dump(dataset.performer_map, f)
@@ -393,6 +463,11 @@ def main():
                 f"(best_epoch={best_epoch}, best_val_loss={best_val:.4f})"
             )
             break
+
+    if test_loader is not None and (save_dir / "best.pt").exists():
+        model.load_state_dict(torch.load(save_dir / "best.pt", map_location=device))
+        best_test = evaluate(model, test_loader, device)
+        print(f"Test | best_loss {best_test:.4f} | best_epoch {best_epoch}")
 
 
 if __name__ == "__main__":

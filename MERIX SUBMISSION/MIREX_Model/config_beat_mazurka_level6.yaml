@@ -3,7 +3,7 @@ data:
   file_ext: npz
   beat_sequence_length: 256      # set to int to slice by beats instead of notes
   beat_stride: 256               # beat window stride (defaults to beat_sequence_length)
-  drop_short: true              # drop pieces shorter than sequence_length
+  drop_short: false              # drop pieces shorter than sequence_length
   max_len: null                 # no note truncation in beat-slice mode
   position_mode: zero        # absolute|window|zero
   use_base_features_only: true  # use only 6 base features

@@ -13,7 +13,7 @@ set -euo pipefail
 cd "$SLURM_SUBMIT_DIR"
 source .venv/bin/activate
 
-split_file="splits/mazurka_piece_split_v2_32_7_5.yaml"
+split_file="splits/mazurka_piece_split_v4_35_9_0.yaml"
 if [ ! -f "$split_file" ]; then
   echo "Missing split file: $split_file" >&2
   exit 1

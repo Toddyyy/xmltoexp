@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=beat_L1to6_rand33_8_3x5
+#SBATCH --job-name=beat_L1to6_rand35_9_0x5
 #SBATCH --partition=gpua800
 #SBATCH --gres=gpu:1
 #SBATCH --qos=1a800
@@ -13,7 +13,7 @@ set -euo pipefail
 cd "$SLURM_SUBMIT_DIR"
 source .venv/bin/activate
 
-split_dir="splits/generated_random_33_8_3_x5"
+split_dir="splits/generated_random_35_9_0_x5"
 mkdir -p "$split_dir"
 
 python - <<'PY'
@@ -36,28 +36,28 @@ all_pieces = [
     'M68-1', 'M68-2', 'M68-3',
 ]
 
-out_dir = Path("splits/generated_random_33_8_3_x5")
+out_dir = Path('splits/generated_random_35_9_0_x5')
 seeds = [1101, 1102, 1103, 1104, 1105]
 
 for idx, seed in enumerate(seeds, start=1):
     rng = random.Random(seed)
     pieces = list(all_pieces)
     rng.shuffle(pieces)
-    train = sorted(pieces[:33])
-    val = sorted(pieces[33:41])
-    test = sorted(pieces[41:44])
+    train = sorted(pieces[:35])
+    val = sorted(pieces[35:44])
+    test = []
     obj = {
-        "version": 1,
-        "notes": "Random reproducible 33/8/3 split for repeated fixed-split comparison",
-        "seed": seed,
-        "train": train,
-        "val": val,
-        "test": test,
+        'version': 1,
+        'notes': 'Random reproducible 35/9/0 fixed split for repeated comparison',
+        'seed': seed,
+        'train': train,
+        'val': val,
+        'test': test,
     }
-    path = out_dir / f"run{idx:02d}.yaml"
-    path.write_text(yaml.safe_dump(obj, sort_keys=False, allow_unicode=False), encoding="utf-8")
+    path = out_dir / f'run{idx:02d}.yaml'
+    path.write_text(yaml.safe_dump(obj, sort_keys=False, allow_unicode=False), encoding='utf-8')
     print(path)
-    print(f"  train={len(train)} val={len(val)} test={len(test)}")
+    print(f'  train={len(train)} val={len(val)} test={len(test)}')
 PY
 
 for run_idx in 01 02 03 04 05; do
@@ -67,7 +67,7 @@ for run_idx in 01 02 03 04 05; do
     exit 1
   fi
 
-  echo "=== Random split run ${run_idx} using ${split_file} ==="
+  echo "=== Fixed split run ${run_idx} using ${split_file} ==="
 
   for level in 1 2 3 4 5 6; do
     cfg="config_beat_mazurka_level${level}.yaml"

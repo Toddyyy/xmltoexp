@@ -1,0 +1,31 @@
+config: /tmp/tmp.Vf0pwztWms/config_beat_mazurka_level1_ratio_feat14_pcond.yaml
+model_path: /gpfs/work/int/yuxuanliu2204/Changheng/xmltoexp/MERIX SUBMISSION/MIREX_Model/check/beat_mazurka/level_1/beat_mazurka_ratio_L1_20260309_235514/best.pt
+split_file: /gpfs/work/int/yuxuanliu2204/Changheng/xmltoexp/MERIX SUBMISSION/MIREX_Model/splits/mazurka_piece_split_v1.yaml
+level: 1
+split: val
+num_files: 323
+window_beats: 128
+window_stride: 128
+tolerance: 2
+head: dist
+pred_peak_params:
+  min_dist: 6
+  height: 0.15
+  prominence: 0.05
+true_peak_params:
+  binary_threshold: 0.5
+  min_dist: 6
+  height: 0.15
+  prominence: 0.05
+micro:
+  tp: 9730
+  fp: 1376
+  fn: 8206
+  precision: 0.8761030073833964
+  recall: 0.5424843889384479
+  f1: 0.6700640451759521
+macro:
+  precision: 0.87426343204405
+  recall: 0.5533859724790586
+  f1: 0.6740704297851694
+per_file_csv: /gpfs/work/int/yuxuanliu2204/Changheng/xmltoexp/MERIX SUBMISSION/MIREX_Model/check/beat_mazurka/level_1/beat_mazurka_ratio_L1_20260309_235514/boundary_eval_val_L1/per_file_metrics.csv

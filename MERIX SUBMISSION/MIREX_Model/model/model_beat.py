@@ -84,6 +84,8 @@ class BeatBoundaryModel(nn.Module):
         prob_loss_type: str = "bce",
         prob_pos_weight: Optional[float] = None,
         prob_loss_weight: float = 1.0,
+        primary_target: str = "dist",
+        dist_loss_weight: float = 1.0,
         boundary_loss_weight: float = 0.0,
         boundary_dice_weight: float = 1.0,
         boundary_focal_alpha: Optional[float] = 0.75,
@@ -98,11 +100,16 @@ class BeatBoundaryModel(nn.Module):
         self.prob_loss_type = prob_loss_type.lower()
         self.prob_pos_weight = prob_pos_weight if prob_pos_weight is not None else pos_weight
         self.prob_loss_weight = float(prob_loss_weight)
+        self.primary_target = primary_target.lower()
+        self.dist_loss_weight = float(dist_loss_weight)
         self.boundary_loss_weight = float(boundary_loss_weight)
         self.boundary_dice_weight = float(boundary_dice_weight)
         self.boundary_focal_alpha = None if boundary_focal_alpha is None else float(boundary_focal_alpha)
         self.boundary_focal_gamma = float(boundary_focal_gamma)
         self.boundary_tolerance = max(0, int(boundary_tolerance))
+        if self.primary_target not in {"dist", "boundary"}:
+            raise ValueError("primary_target must be one of: dist, boundary")
+        self.last_loss_breakdown: Dict[str, Tensor] = {}
         self.performer_cond = bool(config.performer_cond)
         rnn_hidden = config.note_rnn_hidden
         if rnn_hidden is None:
@@ -273,7 +280,13 @@ class BeatBoundaryModel(nn.Module):
                 logits_prob = logits_prob + delta
 
         loss = None
+        self.last_loss_breakdown = {}
         if labels is not None:
+            zero = logits_dist.new_tensor(0.0)
+            dist_loss = zero
+            focal_loss = zero
+            dice_loss = zero
+            prob_loss = zero
             labels, attn_mask_beats = self._align_labels_and_mask(
                 labels, attn_mask_beats, max_beats, device
             )
@@ -281,7 +294,7 @@ class BeatBoundaryModel(nn.Module):
                 per_token = self.loss_fn(logits_dist, labels)
             else:
                 per_token = self.loss_fn(torch.sigmoid(logits_dist), labels)
-            loss = (per_token * attn_mask_beats).sum() / attn_mask_beats.sum().clamp(min=1)
+            dist_loss = (per_token * attn_mask_beats).sum() / attn_mask_beats.sum().clamp(min=1)
 
             if self.dual_head and labels_prob is not None and self.prob_loss_weight != 0.0:
                 labels_prob = self._align_labels(labels_prob, max_beats, device)
@@ -290,7 +303,6 @@ class BeatBoundaryModel(nn.Module):
                 else:
                     per_prob = self.prob_loss_fn(torch.sigmoid(logits_prob), labels_prob)
                 prob_loss = (per_prob * attn_mask_beats).sum() / attn_mask_beats.sum().clamp(min=1)
-                loss = loss + self.prob_loss_weight * prob_loss
 
             if self.boundary_loss_weight != 0.0 and labels_boundary is not None:
                 labels_boundary = self._align_labels(labels_boundary, max_beats, device)
@@ -298,7 +310,23 @@ class BeatBoundaryModel(nn.Module):
                 focal_loss = self._sigmoid_focal_loss(logits_dist, labels_boundary, attn_mask_beats)
                 tolerant_target = self._boundary_tolerant_target(labels_boundary)
                 dice_loss = self._soft_dice_loss(logits_dist, tolerant_target, attn_mask_beats)
+
+            if self.primary_target == "boundary":
+                loss = self.boundary_loss_weight * (focal_loss + self.boundary_dice_weight * dice_loss)
+                loss = loss + self.dist_loss_weight * dist_loss
+            else:
+                loss = dist_loss
                 loss = loss + self.boundary_loss_weight * (focal_loss + self.boundary_dice_weight * dice_loss)
+            if self.prob_loss_weight != 0.0 and self.dual_head and labels_prob is not None:
+                loss = loss + self.prob_loss_weight * prob_loss
+
+            self.last_loss_breakdown = {
+                "dist_loss": dist_loss.detach(),
+                "focal_loss": focal_loss.detach(),
+                "dice_loss": dice_loss.detach(),
+                "prob_loss": prob_loss.detach(),
+                "total_loss": loss.detach(),
+            }
 
         if output_head == "both":
             outputs = {"dist": logits_dist}

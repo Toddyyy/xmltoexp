@@ -62,6 +62,8 @@ def build_model(cfg, input_dim: int) -> BeatBoundaryModel:
     prob_loss_type = cfg.get("training", {}).get("prob_loss_type", "bce")
     prob_pos_weight = cfg.get("training", {}).get("prob_pos_weight")
     prob_loss_weight = cfg.get("training", {}).get("prob_loss_weight", 1.0)
+    primary_target = cfg.get("training", {}).get("primary_target", "dist")
+    dist_loss_weight = cfg.get("training", {}).get("dist_loss_weight", 1.0)
     boundary_loss_weight = cfg.get("training", {}).get("boundary_loss_weight", 0.0)
     boundary_dice_weight = cfg.get("training", {}).get("boundary_dice_weight", 1.0)
     boundary_focal_alpha = cfg.get("training", {}).get("boundary_focal_alpha", 0.75)
@@ -74,6 +76,8 @@ def build_model(cfg, input_dim: int) -> BeatBoundaryModel:
         prob_loss_type=prob_loss_type,
         prob_pos_weight=prob_pos_weight,
         prob_loss_weight=prob_loss_weight,
+        primary_target=primary_target,
+        dist_loss_weight=dist_loss_weight,
         boundary_loss_weight=boundary_loss_weight,
         boundary_dice_weight=boundary_dice_weight,
         boundary_focal_alpha=boundary_focal_alpha,

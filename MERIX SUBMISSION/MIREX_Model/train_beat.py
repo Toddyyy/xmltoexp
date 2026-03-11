@@ -253,6 +253,8 @@ def build_model(cfg, input_dim):
     prob_loss_type = cfg.get("training", {}).get("prob_loss_type", "bce")
     prob_pos_weight = cfg.get("training", {}).get("prob_pos_weight")
     prob_loss_weight = cfg.get("training", {}).get("prob_loss_weight", 1.0)
+    primary_target = cfg.get("training", {}).get("primary_target", "dist")
+    dist_loss_weight = cfg.get("training", {}).get("dist_loss_weight", 1.0)
     boundary_loss_weight = cfg.get("training", {}).get("boundary_loss_weight", 0.0)
     boundary_dice_weight = cfg.get("training", {}).get("boundary_dice_weight", 1.0)
     boundary_focal_alpha = cfg.get("training", {}).get("boundary_focal_alpha", 0.75)
@@ -265,6 +267,8 @@ def build_model(cfg, input_dim):
         prob_loss_type=prob_loss_type,
         prob_pos_weight=prob_pos_weight,
         prob_loss_weight=prob_loss_weight,
+        primary_target=primary_target,
+        dist_loss_weight=dist_loss_weight,
         boundary_loss_weight=boundary_loss_weight,
         boundary_dice_weight=boundary_dice_weight,
         boundary_focal_alpha=boundary_focal_alpha,
@@ -274,8 +278,18 @@ def build_model(cfg, input_dim):
 
 
 def train_one_epoch(model, loader, optimizer, device, grad_clip):
+    def scalar(value):
+        if hasattr(value, "item"):
+            return float(value.item())
+        return float(value)
+
     model.train()
-    total_loss = 0.0
+    totals = {
+        "total_loss": 0.0,
+        "dist_loss": 0.0,
+        "focal_loss": 0.0,
+        "dice_loss": 0.0,
+    }
     total_batches = 0
     for batch in loader:
         note_feats = batch["note_feats"].to(device)
@@ -311,15 +325,30 @@ def train_one_epoch(model, loader, optimizer, device, grad_clip):
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
 
-        total_loss += loss.item()
+        totals["total_loss"] += scalar(loss)
+        breakdown = getattr(model, "last_loss_breakdown", {})
+        totals["dist_loss"] += scalar(breakdown.get("dist_loss", 0.0))
+        totals["focal_loss"] += scalar(breakdown.get("focal_loss", 0.0))
+        totals["dice_loss"] += scalar(breakdown.get("dice_loss", 0.0))
         total_batches += 1
-    return total_loss / max(total_batches, 1)
+    denom = max(total_batches, 1)
+    return {key: value / denom for key, value in totals.items()}
 
 
 @torch.no_grad()
 def evaluate(model, loader, device):
+    def scalar(value):
+        if hasattr(value, "item"):
+            return float(value.item())
+        return float(value)
+
     model.eval()
-    total_loss = 0.0
+    totals = {
+        "total_loss": 0.0,
+        "dist_loss": 0.0,
+        "focal_loss": 0.0,
+        "dice_loss": 0.0,
+    }
     total_batches = 0
     for batch in loader:
         note_feats = batch["note_feats"].to(device)
@@ -349,9 +378,14 @@ def evaluate(model, loader, device):
             labels_prob=labels_prob,
             labels_boundary=labels_boundary,
         )
-        total_loss += loss.item()
+        totals["total_loss"] += scalar(loss)
+        breakdown = getattr(model, "last_loss_breakdown", {})
+        totals["dist_loss"] += scalar(breakdown.get("dist_loss", 0.0))
+        totals["focal_loss"] += scalar(breakdown.get("focal_loss", 0.0))
+        totals["dice_loss"] += scalar(breakdown.get("dice_loss", 0.0))
         total_batches += 1
-    return total_loss / max(total_batches, 1)
+    denom = max(total_batches, 1)
+    return {key: value / denom for key, value in totals.items()}
 
 
 def main():
@@ -459,6 +493,13 @@ def main():
     print(f"val_pieces ({len(split_summary.get('val_pieces', []))}): {split_summary.get('val_pieces', [])}")
     if split_summary.get("test_pieces"):
         print(f"test_pieces ({len(split_summary.get('test_pieces', []))}): {split_summary.get('test_pieces', [])}")
+    print(
+        "loss_setup: "
+        f"primary_target={cfg.get('training', {}).get('primary_target', 'dist')} | "
+        f"dist_loss_weight={cfg.get('training', {}).get('dist_loss_weight', 1.0)} | "
+        f"boundary_loss_weight={cfg.get('training', {}).get('boundary_loss_weight', 0.0)} | "
+        f"boundary_dice_weight={cfg.get('training', {}).get('boundary_dice_weight', 1.0)}"
+    )
 
     best_val = float("inf")
     epochs = cfg["training"]["epochs"]
@@ -469,9 +510,21 @@ def main():
     best_epoch = 0
 
     for epoch in range(1, epochs + 1):
-        train_loss = train_one_epoch(model, train_loader, optimizer, device, grad_clip)
-        val_loss = evaluate(model, val_loader, device)
-        print(f"Epoch {epoch}/{epochs} | train_loss {train_loss:.4f} | val_loss {val_loss:.4f}")
+        train_metrics = train_one_epoch(model, train_loader, optimizer, device, grad_clip)
+        val_metrics = evaluate(model, val_loader, device)
+        train_loss = train_metrics["total_loss"]
+        val_loss = val_metrics["total_loss"]
+        print(
+            f"Epoch {epoch}/{epochs} | "
+            f"train_total_loss {train_metrics['total_loss']:.4f} | "
+            f"train_dist_loss {train_metrics['dist_loss']:.4f} | "
+            f"train_focal_loss {train_metrics['focal_loss']:.4f} | "
+            f"train_dice_loss {train_metrics['dice_loss']:.4f} | "
+            f"val_total_loss {val_metrics['total_loss']:.4f} | "
+            f"val_dist_loss {val_metrics['dist_loss']:.4f} | "
+            f"val_focal_loss {val_metrics['focal_loss']:.4f} | "
+            f"val_dice_loss {val_metrics['dice_loss']:.4f}"
+        )
 
         if val_loss < (best_val - min_delta):
             best_val = val_loss
@@ -492,7 +545,13 @@ def main():
     if test_loader is not None and (save_dir / "best.pt").exists():
         model.load_state_dict(torch.load(save_dir / "best.pt", map_location=device))
         best_test = evaluate(model, test_loader, device)
-        print(f"Test | best_loss {best_test:.4f} | best_epoch {best_epoch}")
+        print(
+            f"Test | total_loss {best_test['total_loss']:.4f} | "
+            f"dist_loss {best_test['dist_loss']:.4f} | "
+            f"focal_loss {best_test['focal_loss']:.4f} | "
+            f"dice_loss {best_test['dice_loss']:.4f} | "
+            f"best_epoch {best_epoch}"
+        )
 
 
 if __name__ == "__main__":

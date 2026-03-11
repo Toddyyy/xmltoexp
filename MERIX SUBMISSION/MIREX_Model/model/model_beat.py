@@ -287,14 +287,16 @@ class BeatBoundaryModel(nn.Module):
             focal_loss = zero
             dice_loss = zero
             prob_loss = zero
-            labels, attn_mask_beats = self._align_labels_and_mask(
-                labels, attn_mask_beats, max_beats, device
-            )
-            if self.loss_on_logits:
-                per_token = self.loss_fn(logits_dist, labels)
-            else:
-                per_token = self.loss_fn(torch.sigmoid(logits_dist), labels)
-            dist_loss = (per_token * attn_mask_beats).sum() / attn_mask_beats.sum().clamp(min=1)
+            use_dist_loss = self.primary_target == "dist" or self.dist_loss_weight != 0.0
+            if use_dist_loss:
+                labels, attn_mask_beats = self._align_labels_and_mask(
+                    labels, attn_mask_beats, max_beats, device
+                )
+                if self.loss_on_logits:
+                    per_token = self.loss_fn(logits_dist, labels)
+                else:
+                    per_token = self.loss_fn(torch.sigmoid(logits_dist), labels)
+                dist_loss = (per_token * attn_mask_beats).sum() / attn_mask_beats.sum().clamp(min=1)
 
             if self.dual_head and labels_prob is not None and self.prob_loss_weight != 0.0:
                 labels_prob = self._align_labels(labels_prob, max_beats, device)

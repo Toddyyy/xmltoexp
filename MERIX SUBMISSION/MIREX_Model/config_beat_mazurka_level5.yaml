@@ -2,10 +2,10 @@ data:
   data_dir: beat_data_mazurka_performer_levels   # directory with *.npz (note_feats + beat_ids + boundary_probs)
   file_ext: npz
   beat_sequence_length: 256      # set to int to slice by beats instead of notes
-  beat_stride: 256               # beat window stride (defaults to beat_sequence_length)
+  beat_stride: 128               # overlapping beat windows for more stable boundary context
   drop_short: false              # drop pieces shorter than sequence_length
   max_len: null                 # no note truncation in beat-slice mode
-  position_mode: zero        # absolute|window|zero
+  position_mode: window        # absolute|window|zero
   use_base_features_only: true  # use only 6 base features
   label_mode: dist           # ratio|dist|dual
   dist_min_dist: 6              # min distance between peaks (beats)
@@ -35,7 +35,7 @@ model:
   dropout: 0.1
   max_len: 512
   include_empty_beats: true
-  performer_cond: true
+  performer_cond: false
   performer_emb_dim: 32
 
 training:
@@ -47,7 +47,7 @@ training:
   loss_type: mse               # mse|bce|huber
   pos_weight: 8.9
   primary_target: boundary     # dist|boundary
-  dist_loss_weight: 0.1
+  dist_loss_weight: 0.0
   boundary_loss_weight: 1.0
   boundary_dice_weight: 0.5
   boundary_focal_alpha: 0.75

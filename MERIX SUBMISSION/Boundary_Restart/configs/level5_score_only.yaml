@@ -1,0 +1,80 @@
+data:
+  npz_dir: ../../MIREX_Model/beat_data_mazurka_performer_levels
+  split_file: ../../MIREX_Model/splits/mazurka_piece_split_v4_35_9_0.yaml
+  level: 5
+  beat_table_path: ../outputs/level5/beat_table_L5.csv.gz
+  peak_distance: 6
+  peak_height: 0.15
+  peak_prominence: 0.05
+  long_note_threshold: 1.0
+  beat_unit_fallback: 1.0
+  symmetry_window: 4
+  deviation_window: 8
+  measure_cycle: 3
+
+evaluation:
+  event_tolerance: 1
+  min_distance: 6
+  prominence: 0.0
+  threshold_grid:
+    start: 0.05
+    stop: 0.95
+    steps: 37
+
+features:
+  exclude:
+    - note_count_norm
+    - mean_pitch_norm
+    - pitch_range_norm
+    - mean_duration_norm
+    - duration_std_norm
+    - pc_unique_ratio
+    - density_delta
+    - contour_delta
+    - pitch_dev
+    - density_dev
+    - pc_entropy
+    - pc_max
+    - pitch_std_norm
+    - pc_cos_prev
+    - pc_cos_next
+    - pc_window_sym
+    - symmetry_cosine
+    - beat_pos_in_measure
+
+baseline:
+  output_dir: ../outputs/level5/baselines
+  models:
+    - logreg
+    - xgboost
+  logistic:
+    C: 1.0
+    max_iter: 3000
+  xgboost:
+    n_estimators: 400
+    learning_rate: 0.05
+    max_depth: 4
+    subsample: 0.8
+    colsample_bytree: 0.8
+    reg_lambda: 1.0
+    min_child_weight: 1.0
+    gamma: 0.0
+
+sequence:
+  output_dir: ../outputs/level5/sequence
+  model_type: bilstm
+  batch_size: 8
+  epochs: 30
+  lr: 0.001
+  weight_decay: 0.0001
+  grad_clip: 1.0
+  early_stop_patience: 5
+  seed: 42
+  hidden_dim: 64
+  num_layers: 2
+  dropout: 0.2
+  tcn_channels:
+    - 64
+    - 64
+    - 64
+  kernel_size: 3

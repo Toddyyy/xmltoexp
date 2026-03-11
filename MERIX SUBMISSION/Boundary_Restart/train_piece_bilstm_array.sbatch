@@ -9,6 +9,7 @@
 #SBATCH --time=24:00:00
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=24G
+#SBATCH --export=ALL
 
 set -euo pipefail
 
@@ -18,7 +19,7 @@ cd "$PROJECT_DIR"
 VENV_PATH="${VENV_PATH:-$PROJECT_DIR/../MIREX_Model/.venv}"
 source "$VENV_PATH/bin/activate"
 
-CONFIG="${CONFIG:-configs/salience_grouped3_hi8_score_only_xml_tok_detector_baseline.yaml}"
+CONFIG="${CONFIG:-configs/salience_grouped3_hi8_score_only_xml_curated.yaml}"
 MODEL="${MODEL:-bilstm}"
 DETECTOR_TARGET="${DETECTOR_TARGET:-midhigh_boundary}"
 MIN_PRECISION="${MIN_PRECISION:-0.95}"

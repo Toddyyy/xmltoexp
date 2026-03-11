@@ -46,6 +46,11 @@ training:
   grad_clip: 1.0
   loss_type: mse               # mse|bce|huber
   pos_weight: 8.9
+  boundary_loss_weight: 0.1
+  boundary_dice_weight: 0.5
+  boundary_focal_alpha: 0.75
+  boundary_focal_gamma: 2.0
+  boundary_tolerance: 1
   device: auto
   seed: 42
   freeze_base: false

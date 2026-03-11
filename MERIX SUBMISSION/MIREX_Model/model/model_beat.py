@@ -13,6 +13,7 @@ from typing import Optional, Tuple, Union, Dict
 import math
 import torch
 from torch import nn, Tensor
+from torch.nn import functional as F
 
 from beat_embedding import BiLSTMNoteToBeatEmbedder
 
@@ -83,6 +84,11 @@ class BeatBoundaryModel(nn.Module):
         prob_loss_type: str = "bce",
         prob_pos_weight: Optional[float] = None,
         prob_loss_weight: float = 1.0,
+        boundary_loss_weight: float = 0.0,
+        boundary_dice_weight: float = 1.0,
+        boundary_focal_alpha: Optional[float] = 0.75,
+        boundary_focal_gamma: float = 2.0,
+        boundary_tolerance: int = 1,
     ):
         super().__init__()
         self.config = config
@@ -92,6 +98,11 @@ class BeatBoundaryModel(nn.Module):
         self.prob_loss_type = prob_loss_type.lower()
         self.prob_pos_weight = prob_pos_weight if prob_pos_weight is not None else pos_weight
         self.prob_loss_weight = float(prob_loss_weight)
+        self.boundary_loss_weight = float(boundary_loss_weight)
+        self.boundary_dice_weight = float(boundary_dice_weight)
+        self.boundary_focal_alpha = None if boundary_focal_alpha is None else float(boundary_focal_alpha)
+        self.boundary_focal_gamma = float(boundary_focal_gamma)
+        self.boundary_tolerance = max(0, int(boundary_tolerance))
         self.performer_cond = bool(config.performer_cond)
         rnn_hidden = config.note_rnn_hidden
         if rnn_hidden is None:
@@ -153,6 +164,35 @@ class BeatBoundaryModel(nn.Module):
             return nn.SmoothL1Loss(reduction="none"), False
         raise ValueError(f"Unsupported loss_type: {loss_type}. Use 'bce', 'mse', 'l1', or 'huber'.")
 
+    def _sigmoid_focal_loss(self, logits: Tensor, targets: Tensor, mask: Tensor) -> Tensor:
+        probs = torch.sigmoid(logits)
+        ce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+        p_t = probs * targets + (1.0 - probs) * (1.0 - targets)
+        focal = (1.0 - p_t).pow(self.boundary_focal_gamma)
+        if self.boundary_focal_alpha is not None:
+            alpha = self.boundary_focal_alpha * targets + (1.0 - self.boundary_focal_alpha) * (1.0 - targets)
+            focal = focal * alpha
+        mask_f = mask.float()
+        return (ce * focal * mask_f).sum() / mask_f.sum().clamp(min=1.0)
+
+    def _boundary_tolerant_target(self, labels_boundary: Tensor) -> Tensor:
+        if self.boundary_tolerance <= 0:
+            return labels_boundary
+        kernel = 2 * self.boundary_tolerance + 1
+        return F.max_pool1d(labels_boundary.unsqueeze(1), kernel_size=kernel, stride=1, padding=self.boundary_tolerance).squeeze(1)
+
+    @staticmethod
+    def _soft_dice_loss(logits: Tensor, targets: Tensor, mask: Tensor) -> Tensor:
+        probs = torch.sigmoid(logits)
+        mask_f = mask.float()
+        intersection = (probs * targets * mask_f).sum(dim=1)
+        denom = ((probs + targets) * mask_f).sum(dim=1)
+        dice = 1.0 - (2.0 * intersection + 1e-6) / (denom + 1e-6)
+        valid = mask_f.sum(dim=1) > 0
+        if valid.any():
+            return dice[valid].mean()
+        return logits.new_tensor(0.0)
+
     def forward(
         self,
         note_feats: Tensor,
@@ -163,6 +203,7 @@ class BeatBoundaryModel(nn.Module):
         attn_mask: Optional[Tensor] = None,
         labels: Optional[Tensor] = None,
         labels_prob: Optional[Tensor] = None,
+        labels_boundary: Optional[Tensor] = None,
         output_head: str = "dist",
     ) -> Tuple[Union[Tensor, Dict[str, Tensor]], Optional[Tensor]]:
         """
@@ -174,6 +215,7 @@ class BeatBoundaryModel(nn.Module):
             attn_mask: 可选 [batch, notes] bool，True 表示该 note 有效。
             labels: 可选 [batch, beats] 目标标签（默认 dist 或 ratio）。
             labels_prob: 可选 [batch, beats] 概率标签（dual head 时使用，非二值）。
+            labels_boundary: 可选 [batch, beats] 二值边界标签，用于 boundary-aware 辅助损失。
             output_head: dist|prob|both，决定返回哪个 logits。
         Returns:
             logits: [batch, beats] 或 {"dist": ..., "prob": ...}
@@ -249,6 +291,14 @@ class BeatBoundaryModel(nn.Module):
                     per_prob = self.prob_loss_fn(torch.sigmoid(logits_prob), labels_prob)
                 prob_loss = (per_prob * attn_mask_beats).sum() / attn_mask_beats.sum().clamp(min=1)
                 loss = loss + self.prob_loss_weight * prob_loss
+
+            if self.boundary_loss_weight != 0.0 and labels_boundary is not None:
+                labels_boundary = self._align_labels(labels_boundary, max_beats, device)
+                labels_boundary = labels_boundary.clamp(0.0, 1.0)
+                focal_loss = self._sigmoid_focal_loss(logits_dist, labels_boundary, attn_mask_beats)
+                tolerant_target = self._boundary_tolerant_target(labels_boundary)
+                dice_loss = self._soft_dice_loss(logits_dist, tolerant_target, attn_mask_beats)
+                loss = loss + self.boundary_loss_weight * (focal_loss + self.boundary_dice_weight * dice_loss)
 
         if output_head == "both":
             outputs = {"dist": logits_dist}

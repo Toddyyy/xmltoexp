@@ -253,6 +253,11 @@ def build_model(cfg, input_dim):
     prob_loss_type = cfg.get("training", {}).get("prob_loss_type", "bce")
     prob_pos_weight = cfg.get("training", {}).get("prob_pos_weight")
     prob_loss_weight = cfg.get("training", {}).get("prob_loss_weight", 1.0)
+    boundary_loss_weight = cfg.get("training", {}).get("boundary_loss_weight", 0.0)
+    boundary_dice_weight = cfg.get("training", {}).get("boundary_dice_weight", 1.0)
+    boundary_focal_alpha = cfg.get("training", {}).get("boundary_focal_alpha", 0.75)
+    boundary_focal_gamma = cfg.get("training", {}).get("boundary_focal_gamma", 2.0)
+    boundary_tolerance = cfg.get("training", {}).get("boundary_tolerance", 1)
     return BeatBoundaryModel(
         model_cfg,
         pos_weight=pos_weight,
@@ -260,6 +265,11 @@ def build_model(cfg, input_dim):
         prob_loss_type=prob_loss_type,
         prob_pos_weight=prob_pos_weight,
         prob_loss_weight=prob_loss_weight,
+        boundary_loss_weight=boundary_loss_weight,
+        boundary_dice_weight=boundary_dice_weight,
+        boundary_focal_alpha=boundary_focal_alpha,
+        boundary_focal_gamma=boundary_focal_gamma,
+        boundary_tolerance=boundary_tolerance,
     )
 
 
@@ -274,6 +284,9 @@ def train_one_epoch(model, loader, optimizer, device, grad_clip):
         labels_prob = batch.get("labels_prob")
         if labels_prob is not None:
             labels_prob = labels_prob.to(device)
+        labels_boundary = batch.get("labels_boundary")
+        if labels_boundary is not None:
+            labels_boundary = labels_boundary.to(device)
         mask = batch["attn_mask"].to(device)
         max_beats = int(batch["max_beats"].item())
         num_beats = batch["num_beats"].to(device)
@@ -291,6 +304,7 @@ def train_one_epoch(model, loader, optimizer, device, grad_clip):
             attn_mask=mask,
             labels=labels,
             labels_prob=labels_prob,
+            labels_boundary=labels_boundary,
         )
         loss.backward()
         if grad_clip:
@@ -314,6 +328,9 @@ def evaluate(model, loader, device):
         labels_prob = batch.get("labels_prob")
         if labels_prob is not None:
             labels_prob = labels_prob.to(device)
+        labels_boundary = batch.get("labels_boundary")
+        if labels_boundary is not None:
+            labels_boundary = labels_boundary.to(device)
         mask = batch["attn_mask"].to(device)
         max_beats = int(batch["max_beats"].item())
         num_beats = batch["num_beats"].to(device)
@@ -330,6 +347,7 @@ def evaluate(model, loader, device):
             attn_mask=mask,
             labels=labels,
             labels_prob=labels_prob,
+            labels_boundary=labels_boundary,
         )
         total_loss += loss.item()
         total_batches += 1

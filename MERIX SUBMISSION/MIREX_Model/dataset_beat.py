@@ -391,6 +391,13 @@ class BeatBoundaryDataset(Dataset):
         tau = max(self.dist_tau, 1e-6)
         return np.exp(-d / tau).astype(np.float32)
 
+    def _boundary_target(self, boundary_ratio: np.ndarray) -> np.ndarray:
+        target = np.zeros(len(boundary_ratio), dtype=np.float32)
+        locs = self._ratio_to_locs(boundary_ratio)
+        if locs.size > 0:
+            target[locs] = 1.0
+        return target
+
     def __len__(self) -> int:
         return len(self.samples)
 
@@ -461,6 +468,7 @@ class BeatBoundaryDataset(Dataset):
         performer_id = self._get_performer_id(sample["path"])
 
         labels_dist = None
+        labels_boundary = self._boundary_target(labels_ratio)
         if self.label_mode in {"dist", "dual"}:
             labels_dist = self._distance_target(labels_ratio)
         elif self.label_mode != "ratio":
@@ -471,12 +479,14 @@ class BeatBoundaryDataset(Dataset):
             feats, beat_ids, labels_ratio, num_beats, beat_start, beat_end = self._slice_by_beats(
                 feats, beat_ids, labels_ratio, beat_start, sample["beat_end"]
             )
+            labels_boundary = labels_boundary[beat_start:beat_end]
             if labels_dist is not None:
                 labels_dist = labels_dist[beat_start:beat_end]
         elif sample["start"] is not None:
             feats, beat_ids, labels_ratio, num_beats, bmin, bmax = self._window_and_rebase(
                 feats, beat_ids, labels_ratio, sample["start"], sample["end"]
             )
+            labels_boundary = labels_boundary[bmin : bmax + 1] if num_beats > 0 else labels_boundary[:0]
             if labels_dist is not None:
                 labels_dist = labels_dist[bmin : bmax + 1] if num_beats > 0 else labels_dist[:0]
         else:
@@ -488,6 +498,8 @@ class BeatBoundaryDataset(Dataset):
 
             if labels_ratio.shape[0] > num_beats:
                 labels_ratio = labels_ratio[:num_beats]
+            if labels_boundary.shape[0] > num_beats:
+                labels_boundary = labels_boundary[:num_beats]
             if labels_dist is not None and labels_dist.shape[0] > num_beats:
                 labels_dist = labels_dist[:num_beats]
 
@@ -514,6 +526,7 @@ class BeatBoundaryDataset(Dataset):
             "note_feats": feats_t,
             "beat_ids": beat_ids_t,
             "labels": labels_t,
+            "labels_boundary": torch.tensor(labels_boundary, dtype=torch.float32),
             "num_beats": num_beats,
             "length": length,
             "performer_id": performer_id,
@@ -533,6 +546,8 @@ def collate_beat(batch: List[Dict[str, Any]], pad_to: Optional[int] = None) -> D
     note_feats = torch.zeros(len(batch), max_len, feat_dim, dtype=torch.float32)
     beat_ids = torch.full((len(batch), max_len), -1, dtype=torch.long)
     labels = torch.zeros(len(batch), max_beats, dtype=torch.float32)
+    has_boundary = any("labels_boundary" in b for b in batch)
+    labels_boundary = torch.zeros(len(batch), max_beats, dtype=torch.float32) if has_boundary else None
     has_prob = any("labels_prob" in b for b in batch)
     labels_prob = torch.zeros(len(batch), max_beats, dtype=torch.float32) if has_prob else None
     has_performer = any("performer_id" in b for b in batch)
@@ -545,6 +560,8 @@ def collate_beat(batch: List[Dict[str, Any]], pad_to: Optional[int] = None) -> D
         beat_ids[i, :l] = item["beat_ids"][:l]
         if item["labels"].numel() > 0:
             labels[i, : item["labels"].shape[0]] = item["labels"]
+        if has_boundary and "labels_boundary" in item and item["labels_boundary"].numel() > 0:
+            labels_boundary[i, : item["labels_boundary"].shape[0]] = item["labels_boundary"]
         if has_prob and "labels_prob" in item and item["labels_prob"].numel() > 0:
             labels_prob[i, : item["labels_prob"].shape[0]] = item["labels_prob"]
         attn_mask[i, :l] = True
@@ -562,6 +579,8 @@ def collate_beat(batch: List[Dict[str, Any]], pad_to: Optional[int] = None) -> D
     }
     if has_prob:
         out["labels_prob"] = labels_prob
+    if has_boundary:
+        out["labels_boundary"] = labels_boundary
     if has_performer:
         out["performer_ids"] = performer_ids
     return out

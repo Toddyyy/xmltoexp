@@ -429,11 +429,18 @@ def main():
         base_save_dir = base_save_dir / f"level_{args.level}"
     save_dir = base_save_dir / exp_name
     save_dir.mkdir(parents=True, exist_ok=True)
-    with (save_dir / "split_summary.yaml").open("w") as f:
+    split_summary_path = save_dir / "split_summary.yaml"
+    with split_summary_path.open("w") as f:
         yaml.safe_dump(split_summary, f, sort_keys=False)
     if cfg.get("model", {}).get("performer_cond") and getattr(dataset, "performer_map", None):
         with (save_dir / "performer_map.yaml").open("w") as f:
             yaml.safe_dump(dataset.performer_map, f)
+    print(f"save_dir: {save_dir}")
+    print(f"split_summary: {split_summary_path}")
+    print(f"train_pieces ({len(split_summary.get('train_pieces', []))}): {split_summary.get('train_pieces', [])}")
+    print(f"val_pieces ({len(split_summary.get('val_pieces', []))}): {split_summary.get('val_pieces', [])}")
+    if split_summary.get("test_pieces"):
+        print(f"test_pieces ({len(split_summary.get('test_pieces', []))}): {split_summary.get('test_pieces', [])}")
 
     best_val = float("inf")
     epochs = cfg["training"]["epochs"]

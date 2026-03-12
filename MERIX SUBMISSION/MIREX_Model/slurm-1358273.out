@@ -1,0 +1,14 @@
+Using device: cuda
+save_dir: check/beat_mazurka/level_5/beat_mazurka_L5_20260312_163212
+split_summary: check/beat_mazurka/level_5/beat_mazurka_L5_20260312_163212/split_summary.yaml
+train_pieces (35): ['M06-1', 'M06-3', 'M07-1', 'M07-2', 'M07-3', 'M17-4', 'M24-1', 'M24-2', 'M24-3', 'M24-4', 'M30-3', 'M33-1', 'M33-2', 'M33-3', 'M33-4', 'M41-1', 'M41-2', 'M41-3', 'M41-4', 'M50-1', 'M50-2', 'M50-3', 'M56-1', 'M56-2', 'M56-3', 'M59-1', 'M59-2', 'M63-1', 'M63-3', 'M67-1', 'M67-2', 'M67-3', 'M68-1', 'M68-2', 'M68-3']
+val_pieces (9): ['M06-2', 'M17-1', 'M17-2', 'M17-3', 'M30-1', 'M30-2', 'M30-4', 'M59-3', 'M67-4']
+target_setup: target_mode=piece_union_mean | boundary_target_mode=soft
+loss_setup: primary_target=boundary | dist_loss_weight=0.0 | boundary_loss_weight=1.0 | boundary_dice_weight=0.5
+Epoch 1/100 | train_total_loss 0.4657 | train_dist_loss 0.0000 | train_focal_loss 0.0056 | train_dice_loss 0.9203 | val_total_loss 0.4809 | val_dist_loss 0.0000 | val_focal_loss 0.0080 | val_dice_loss 0.9459
+Epoch 2/100 | train_total_loss 0.4329 | train_dist_loss 0.0000 | train_focal_loss 0.0091 | train_dice_loss 0.8478 | val_total_loss 0.4813 | val_dist_loss 0.0000 | val_focal_loss 0.0104 | val_dice_loss 0.9418
+Epoch 3/100 | train_total_loss 0.4139 | train_dist_loss 0.0000 | train_focal_loss 0.0099 | train_dice_loss 0.8080 | val_total_loss 0.4869 | val_dist_loss 0.0000 | val_focal_loss 0.0185 | val_dice_loss 0.9367
+Epoch 4/100 | train_total_loss 0.4025 | train_dist_loss 0.0000 | train_focal_loss 0.0103 | train_dice_loss 0.7845 | val_total_loss 0.5004 | val_dist_loss 0.0000 | val_focal_loss 0.0096 | val_dice_loss 0.9817
+Epoch 5/100 | train_total_loss 0.3967 | train_dist_loss 0.0000 | train_focal_loss 0.0105 | train_dice_loss 0.7725 | val_total_loss 0.4947 | val_dist_loss 0.0000 | val_focal_loss 0.0106 | val_dice_loss 0.9681
+Epoch 6/100 | train_total_loss 0.3945 | train_dist_loss 0.0000 | train_focal_loss 0.0106 | train_dice_loss 0.7678 | val_total_loss 0.4932 | val_dist_loss 0.0000 | val_focal_loss 0.0088 | val_dice_loss 0.9687
+Early stopping at epoch 6: no val improvement for 5 epochs (best_epoch=1, best_val_loss=0.4809)

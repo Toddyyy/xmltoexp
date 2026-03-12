@@ -7,7 +7,7 @@ data:
   max_len: null                 # no note truncation in beat-slice mode
   position_mode: window        # absolute|window|zero
   use_base_features_only: true  # use only 6 base features
-  label_mode: dist           # ratio|dist|dual
+  label_mode: ratio          # ratio|dist|dual
   dist_min_dist: 6              # min distance between peaks (beats)
   dist_height: 0.15             # peak height threshold
   dist_prominence: 0.05         # peak prominence threshold
@@ -25,6 +25,8 @@ data:
   label_binarize_threshold: null
   piece_id_regex: '^(M\\d+-\\d+)'   # group by piece id for train/val split
   performer_id_regex: '(pid[^_]+)'
+  target_mode: piece_union_mean     # compare every performer sample to same-piece same-level union frequency target
+  boundary_target_mode: soft        # keep performer frequency weights instead of collapsing to binary peaks
 
 model:
   input_dim: 6                 # 6 base features only

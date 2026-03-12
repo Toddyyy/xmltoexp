@@ -100,6 +100,10 @@ def create_dataloaders(cfg, level=None, split_file=None):
         max_samples=cfg["data"].get("max_samples"),
         value_ranges=cfg["data"].get("value_ranges"),
         label_binarize_threshold=cfg["data"].get("label_binarize_threshold"),
+        piece_id_regex=cfg["data"].get("piece_id_regex"),
+        piece_id_delim=cfg["data"].get("piece_id_delim"),
+        target_mode=cfg["data"].get("target_mode", "sample"),
+        boundary_target_mode=cfg["data"].get("boundary_target_mode", "peaks"),
     )
 
     def piece_id_from_path(path: Path) -> str:
@@ -133,6 +137,20 @@ def create_dataloaders(cfg, level=None, split_file=None):
     piece_ids = [piece_id_from_path(s["path"]) for s in dataset.samples]
     unique_pieces = sorted({pid for pid in piece_ids})
     split_summary = {}
+    active_target_summary = None
+    if getattr(dataset, "target_mode", "sample") != "sample":
+        active_groups = {}
+        for sample in dataset.samples:
+            path = Path(sample["path"])
+            group_key = (piece_id_from_path(path), dataset._extract_level_suffix(path))
+            active_groups.setdefault(group_key, set()).add(path)
+        active_sizes = [len(paths) for paths in active_groups.values()]
+        active_target_summary = {
+            "active_piece_level_groups": len(active_groups),
+            "active_min_group_size": int(min(active_sizes)) if active_sizes else 0,
+            "active_max_group_size": int(max(active_sizes)) if active_sizes else 0,
+            "active_mean_group_size": float(sum(active_sizes) / len(active_sizes)) if active_sizes else 0.0,
+        }
 
     if split_file is not None:
         with open(split_file, "r") as f:
@@ -192,6 +210,10 @@ def create_dataloaders(cfg, level=None, split_file=None):
             "val_pieces": sorted(val_pieces),
             "test_pieces": [],
         }
+    if getattr(dataset, "target_summary", None):
+        split_summary["targets"] = dict(dataset.target_summary)
+        if active_target_summary is not None:
+            split_summary["targets"].update(active_target_summary)
 
     pad_to = cfg["data"]["max_len"]
     collate_fn = lambda batch: collate_beat(batch, pad_to=pad_to)
@@ -493,6 +515,11 @@ def main():
     print(f"val_pieces ({len(split_summary.get('val_pieces', []))}): {split_summary.get('val_pieces', [])}")
     if split_summary.get("test_pieces"):
         print(f"test_pieces ({len(split_summary.get('test_pieces', []))}): {split_summary.get('test_pieces', [])}")
+    print(
+        "target_setup: "
+        f"target_mode={cfg.get('data', {}).get('target_mode', 'sample')} | "
+        f"boundary_target_mode={cfg.get('data', {}).get('boundary_target_mode', 'peaks')}"
+    )
     print(
         "loss_setup: "
         f"primary_target={cfg.get('training', {}).get('primary_target', 'dist')} | "

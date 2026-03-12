@@ -50,6 +50,10 @@ class BeatBoundaryDataset(Dataset):
         value_ranges: Optional[Dict[str, List[float]]] = None,
         label_binarize_threshold: Optional[float] = None,
         performer_id_regex: Optional[str] = None,
+        piece_id_regex: Optional[str] = None,
+        piece_id_delim: Optional[str] = None,
+        target_mode: str = "sample",
+        boundary_target_mode: str = "peaks",
     ):
         super().__init__()
         self.data_dir = Path(data_dir)
@@ -80,10 +84,18 @@ class BeatBoundaryDataset(Dataset):
         self.value_ranges = self._build_value_ranges(value_ranges)
         self.label_binarize_threshold = label_binarize_threshold
         self.performer_id_regex = performer_id_regex
+        self.piece_id_regex = piece_id_regex
+        self.piece_id_delim = piece_id_delim
+        self.target_mode = target_mode
+        self.boundary_target_mode = boundary_target_mode
         if self.position_mode not in {"absolute", "window", "zero"}:
             raise ValueError("position_mode must be one of: absolute, window, zero")
         if self.label_mode not in {"ratio", "dist", "dual"}:
             raise ValueError("label_mode must be one of: ratio, dist, dual")
+        if self.target_mode not in {"sample", "piece_union_mean"}:
+            raise ValueError("target_mode must be one of: sample, piece_union_mean")
+        if self.boundary_target_mode not in {"peaks", "soft"}:
+            raise ValueError("boundary_target_mode must be one of: peaks, soft")
 
         pattern = str(self.data_dir / f"*.{self.file_ext}")
         all_files: List[Path] = sorted(Path(p) for p in glob.glob(pattern))
@@ -97,6 +109,7 @@ class BeatBoundaryDataset(Dataset):
             )
         self.performer_map = self._build_performer_map()
         self.num_performers = len(self.performer_map)
+        self.target_cache, self.target_summary = self._build_target_cache()
 
         # Peek to infer feature dimension
         first = self._load_file(self.files[0])
@@ -123,6 +136,40 @@ class BeatBoundaryDataset(Dataset):
         except Exception:
             return False
         return False
+
+    def _candidate_piece_patterns(self) -> List[str]:
+        regex = self.piece_id_regex
+        if not regex:
+            return []
+        patterns = [regex]
+        if "\\\\" in regex:
+            try:
+                patterns.append(regex.encode("utf-8").decode("unicode_escape"))
+            except UnicodeDecodeError:
+                pass
+        return patterns
+
+    def _extract_piece_id(self, path: Path) -> str:
+        stem = path.stem
+        for pattern in self._candidate_piece_patterns():
+            try:
+                m = re.search(pattern, stem)
+            except re.error:
+                continue
+            if m:
+                return m.group(1) if m.groups() else m.group(0)
+        if self.piece_id_delim and self.piece_id_delim in stem:
+            return stem.split(self.piece_id_delim)[0]
+        if "_" in stem:
+            return stem.split("_")[0]
+        return stem
+
+    @staticmethod
+    def _extract_level_suffix(path: Path) -> Optional[str]:
+        m = re.search(r"_L(\d+)$", path.stem)
+        if not m:
+            return None
+        return f"L{m.group(1)}"
 
     def _extract_performer_tag(self, path: Path) -> Optional[str]:
         stem = path.stem
@@ -186,6 +233,51 @@ class BeatBoundaryDataset(Dataset):
                 beat_ids = np.asarray(data["beat_ids"])
                 return int(np.max(beat_ids) + 1) if beat_ids.size > 0 else 0
         raise ValueError(f"Unsupported file_ext: {self.file_ext}")
+
+    def _load_boundary_probs(self, path: Path) -> np.ndarray:
+        if self.file_ext == "npz":
+            with np.load(path, mmap_mode="r") as data:
+                return np.asarray(data["boundary_probs"], dtype=np.float32)
+        if self.file_ext == "pt":
+            data = torch.load(path, map_location="cpu")
+            boundary = data["boundary_probs"]
+            if isinstance(boundary, torch.Tensor):
+                boundary = boundary.detach().cpu().numpy()
+            return np.asarray(boundary, dtype=np.float32)
+        raise ValueError(f"Unsupported file_ext: {self.file_ext}")
+
+    def _build_target_cache(self) -> Tuple[Dict[Path, np.ndarray], Dict[str, Any]]:
+        if self.target_mode == "sample":
+            return {}, {"target_mode": "sample"}
+
+        groups: Dict[Tuple[str, Optional[str]], List[Path]] = {}
+        for path in self.files:
+            piece_id = self._extract_piece_id(path)
+            level_suffix = self._extract_level_suffix(path)
+            groups.setdefault((piece_id, level_suffix), []).append(path)
+
+        cache: Dict[Path, np.ndarray] = {}
+        group_sizes: List[int] = []
+        for _, paths in groups.items():
+            labels = [self._load_boundary_probs(path) for path in paths]
+            ref_len = labels[0].shape[0]
+            if any(label.shape[0] != ref_len for label in labels[1:]):
+                bad = [str(path) for path in paths]
+                raise ValueError(f"boundary_probs length mismatch within piece union group: {bad}")
+            target = np.mean(np.stack(labels, axis=0), axis=0).astype(np.float32)
+            for path in paths:
+                cache[path] = target
+            group_sizes.append(len(paths))
+
+        summary = {
+            "target_mode": self.target_mode,
+            "boundary_target_mode": self.boundary_target_mode,
+            "num_piece_level_groups": len(groups),
+            "min_group_size": int(min(group_sizes)) if group_sizes else 0,
+            "max_group_size": int(max(group_sizes)) if group_sizes else 0,
+            "mean_group_size": float(np.mean(group_sizes)) if group_sizes else 0.0,
+        }
+        return cache, summary
 
     def _build_samples(self) -> List[Dict[str, Any]]:
         if self.beat_sequence_length is not None:
@@ -398,6 +490,19 @@ class BeatBoundaryDataset(Dataset):
             target[locs] = 1.0
         return target
 
+    def _get_target_ratio(self, path: Path, default_ratio: np.ndarray) -> np.ndarray:
+        if self.target_mode == "sample":
+            return np.asarray(default_ratio, dtype=np.float32)
+        target = self.target_cache.get(path)
+        if target is None:
+            raise KeyError(f"Missing target cache for {path}")
+        return np.asarray(target, dtype=np.float32)
+
+    def _build_boundary_labels(self, boundary_ratio: np.ndarray) -> np.ndarray:
+        if self.boundary_target_mode == "soft":
+            return np.clip(np.asarray(boundary_ratio, dtype=np.float32), 0.0, 1.0)
+        return self._boundary_target(boundary_ratio)
+
     def __len__(self) -> int:
         return len(self.samples)
 
@@ -463,12 +568,12 @@ class BeatBoundaryDataset(Dataset):
         data = self._load_file(sample["path"])
         feats = data["note_feats"]
         beat_ids = data["beat_ids"]
-        labels_ratio = data["boundary_probs"]
+        labels_ratio = self._get_target_ratio(sample["path"], data["boundary_probs"])
         num_beats = data["num_beats"]
         performer_id = self._get_performer_id(sample["path"])
 
         labels_dist = None
-        labels_boundary = self._boundary_target(labels_ratio)
+        labels_boundary = self._build_boundary_labels(labels_ratio)
         if self.label_mode in {"dist", "dual"}:
             labels_dist = self._distance_target(labels_ratio)
         elif self.label_mode != "ratio":

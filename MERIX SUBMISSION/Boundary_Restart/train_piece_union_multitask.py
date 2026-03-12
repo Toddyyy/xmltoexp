@@ -10,15 +10,14 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
-from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, classification_report, f1_score
-from sklearn.preprocessing import StandardScaler
 from torch import nn
+from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 from torch.utils.data import DataLoader, Dataset
 
 from boundary_restart.config import load_config, resolve_path, threshold_grid
 from boundary_restart.metrics import evaluate_labeled_event_sequences, search_union_frequency_threshold
-from boundary_restart.models import build_sequence_model
+from boundary_restart.models import TemporalBlock
 from boundary_restart.table_io import feature_columns, load_table
 
 
@@ -50,39 +49,6 @@ def select_feature_columns(cfg: dict, columns: list[str]) -> list[str]:
     if exclude:
         selected = [col for col in selected if col not in exclude]
     return [col for col in selected if col != "protocol_split"]
-
-
-def select_grader_feature_columns(cfg: dict, detector_cols: list[str], all_columns: list[str]) -> list[str]:
-    feature_cfg = cfg.get("features", {})
-    grader_include = feature_cfg.get("grader_include")
-    grader_extra_include = feature_cfg.get("grader_extra_include")
-    if grader_include:
-        include_set = set(grader_include)
-        return [col for col in all_columns if col in include_set and col != "protocol_split"]
-    if grader_extra_include:
-        selected = list(detector_cols)
-        existing = set(selected)
-        for col in grader_extra_include:
-            if col in all_columns and col not in existing and col != "protocol_split":
-                selected.append(col)
-                existing.add(col)
-        return selected
-    return list(detector_cols)
-
-
-def detector_labels(stage_class: np.ndarray, mode: str) -> np.ndarray:
-    stage_class = np.asarray(stage_class, dtype=np.int64)
-    if mode == "any_boundary":
-        return (stage_class > 0).astype(np.float32)
-    if mode == "midhigh_boundary":
-        return (stage_class >= 2).astype(np.float32)
-    if mode == "low_boundary":
-        return (stage_class == 1).astype(np.float32)
-    if mode == "mid_boundary":
-        return (stage_class == 2).astype(np.float32)
-    if mode == "high_boundary":
-        return (stage_class >= 3).astype(np.float32)
-    raise ValueError(f"Unsupported detector target mode: {mode}")
 
 
 def apply_piece_protocol_split(
@@ -135,16 +101,17 @@ def build_loss_weights(
     return weights.astype(np.float32)
 
 
-def build_piece_union_frame(df: pd.DataFrame, feature_cols: list[str], target_mode: str) -> pd.DataFrame:
+def build_piece_union_frame(df: pd.DataFrame, feature_cols: list[str]) -> pd.DataFrame:
     frame = df.copy()
-    frame["detector_binary"] = detector_labels(frame["stage_class"].to_numpy(dtype=np.int64), mode=target_mode)
+    frame["any_binary"] = (frame["stage_class"].to_numpy(dtype=np.int64) > 0).astype(np.float32)
     frame["low_binary"] = (frame["stage_class"].to_numpy(dtype=np.int64) == 1).astype(np.float32)
     frame["mid_binary"] = (frame["stage_class"].to_numpy(dtype=np.int64) == 2).astype(np.float32)
     frame["high_binary"] = (frame["stage_class"].to_numpy(dtype=np.int64) >= 3).astype(np.float32)
+
     agg_spec: dict[str, str] = {
         "protocol_split": "first",
         "num_beats": "first",
-        "detector_binary": "mean",
+        "any_binary": "mean",
         "low_binary": "mean",
         "mid_binary": "mean",
         "high_binary": "mean",
@@ -157,17 +124,18 @@ def build_piece_union_frame(df: pd.DataFrame, feature_cols: list[str], target_mo
         frame.sort_values(["piece_id", "beat_idx", "sample_id"])
         .groupby(["piece_id", "beat_idx"], sort=False)
         .agg(agg_spec)
-        .rename(columns={"detector_binary": "frequency_target", "sample_id": "performer_count"})
+        .rename(
+            columns={
+                "any_binary": "any_frequency",
+                "low_binary": "low_frequency",
+                "mid_binary": "mid_frequency",
+                "high_binary": "high_frequency",
+                "sample_id": "performer_count",
+            }
+        )
         .reset_index()
     )
-    piece["union_target"] = (piece["frequency_target"] > 0.0).astype(np.float32)
-    piece = piece.rename(
-        columns={
-            "low_binary": "low_frequency",
-            "mid_binary": "mid_frequency",
-            "high_binary": "high_frequency",
-        }
-    )
+    piece["union_target"] = (piece["any_frequency"] > 0.0).astype(np.float32)
     stage_freq = piece[["low_frequency", "mid_frequency", "high_frequency"]].to_numpy(dtype=np.float32)
     dominant_idx = np.argmax(stage_freq, axis=1) + 1
     dominant_idx = np.where(piece["union_target"].to_numpy(dtype=np.float32) > 0.0, dominant_idx, 0)
@@ -176,7 +144,106 @@ def build_piece_union_frame(df: pd.DataFrame, feature_cols: list[str], target_mo
     return piece
 
 
-class PieceUnionDataset(Dataset):
+class MultiHeadBiLSTM(nn.Module):
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int = 64,
+        num_layers: int = 2,
+        dropout: float = 0.2,
+        stage_output_dim: int = 3,
+    ):
+        super().__init__()
+        self.input_proj = nn.Linear(input_dim, hidden_dim)
+        self.encoder = nn.LSTM(
+            input_size=hidden_dim,
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
+            dropout=dropout if num_layers > 1 else 0.0,
+            bidirectional=True,
+            batch_first=True,
+        )
+        self.dropout = nn.Dropout(dropout)
+        self.detector_head = nn.Linear(hidden_dim * 2, 1)
+        self.stage_head = nn.Linear(hidden_dim * 2, stage_output_dim)
+
+    def forward(self, x: torch.Tensor, lengths: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+        x = self.input_proj(x)
+        if lengths is not None:
+            packed = pack_padded_sequence(
+                x,
+                lengths.detach().to(device="cpu", dtype=torch.int64),
+                batch_first=True,
+                enforce_sorted=False,
+            )
+            packed_out, _ = self.encoder(packed)
+            x, _ = pad_packed_sequence(packed_out, batch_first=True, total_length=x.size(1))
+        else:
+            x, _ = self.encoder(x)
+        x = self.dropout(x)
+        detector_logits = self.detector_head(x).squeeze(-1)
+        stage_logits = self.stage_head(x)
+        return detector_logits, stage_logits
+
+
+class MultiHeadTCN(nn.Module):
+    def __init__(
+        self,
+        input_dim: int,
+        channels: list[int],
+        kernel_size: int = 3,
+        dropout: float = 0.2,
+        stage_output_dim: int = 3,
+    ):
+        super().__init__()
+        blocks = []
+        in_channels = input_dim
+        for block_idx, out_channels in enumerate(channels):
+            blocks.append(
+                TemporalBlock(
+                    in_channels=in_channels,
+                    out_channels=out_channels,
+                    kernel_size=kernel_size,
+                    dilation=2 ** block_idx,
+                    dropout=dropout,
+                )
+            )
+            in_channels = out_channels
+        self.encoder = nn.Sequential(*blocks)
+        self.detector_head = nn.Conv1d(in_channels, 1, 1)
+        self.stage_head = nn.Conv1d(in_channels, stage_output_dim, 1)
+
+    def forward(self, x: torch.Tensor, lengths: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+        del lengths
+        x = x.transpose(1, 2)
+        h = self.encoder(x)
+        detector_logits = self.detector_head(h).squeeze(1)
+        stage_logits = self.stage_head(h).transpose(1, 2)
+        return detector_logits, stage_logits
+
+
+def build_multitask_model(model_type: str, input_dim: int, cfg: dict) -> nn.Module:
+    seq_cfg = cfg.get("sequence", {})
+    model_type = model_type.lower()
+    if model_type == "bilstm":
+        return MultiHeadBiLSTM(
+            input_dim=input_dim,
+            hidden_dim=int(seq_cfg.get("hidden_dim", 64)),
+            num_layers=int(seq_cfg.get("num_layers", 2)),
+            dropout=float(seq_cfg.get("dropout", 0.2)),
+        )
+    if model_type == "tcn":
+        channels = [int(v) for v in seq_cfg.get("tcn_channels", [64, 64, 64])]
+        return MultiHeadTCN(
+            input_dim=input_dim,
+            channels=channels,
+            kernel_size=int(seq_cfg.get("kernel_size", 3)),
+            dropout=float(seq_cfg.get("dropout", 0.2)),
+        )
+    raise ValueError(f"Unsupported model_type: {model_type}")
+
+
+class PieceUnionMultitaskDataset(Dataset):
     def __init__(
         self,
         samples: list[dict],
@@ -204,29 +271,29 @@ class PieceUnionDataset(Dataset):
             "piece_id": sample["piece_id"],
             "beat_idx": sample["beat_idx"].astype(np.int32),
             "features": features.astype(np.float32),
-            "labels": sample["frequency_target"].astype(np.float32),
-            "union_labels": sample["union_target"].astype(np.float32),
-            "frequency_target": sample["frequency_target"].astype(np.float32),
-            "performer_count": sample["performer_count"].astype(np.int32),
+            "any_frequency": sample["any_frequency"].astype(np.float32),
+            "union_target": sample["union_target"].astype(np.float32),
+            "stage_frequency": sample["stage_frequency"].astype(np.float32),
+            "dominant_stage": sample["dominant_stage"].astype(np.int64),
             "loss_weights": build_loss_weights(
                 sample["union_target"],
                 hard_negative_radius=self.hard_negative_radius,
                 hard_negative_weight=self.hard_negative_weight,
                 easy_negative_weight=self.easy_negative_weight,
             ),
-            "length": int(sample["frequency_target"].shape[0]),
+            "length": int(sample["any_frequency"].shape[0]),
         }
 
 
-def collate_piece_union(batch: list[dict]) -> dict:
+def collate_multitask(batch: list[dict]) -> dict:
     lengths = [item["length"] for item in batch]
     max_len = max(lengths)
     feat_dim = batch[0]["features"].shape[1]
     features = torch.zeros(len(batch), max_len, feat_dim, dtype=torch.float32)
-    labels = torch.zeros(len(batch), max_len, dtype=torch.float32)
-    union_labels = torch.zeros(len(batch), max_len, dtype=torch.float32)
-    frequency_target = torch.zeros(len(batch), max_len, dtype=torch.float32)
-    performer_count = torch.zeros(len(batch), max_len, dtype=torch.int64)
+    any_frequency = torch.zeros(len(batch), max_len, dtype=torch.float32)
+    union_target = torch.zeros(len(batch), max_len, dtype=torch.float32)
+    stage_frequency = torch.zeros(len(batch), max_len, 3, dtype=torch.float32)
+    dominant_stage = torch.zeros(len(batch), max_len, dtype=torch.int64)
     loss_weights = torch.ones(len(batch), max_len, dtype=torch.float32)
     beat_idx = torch.zeros(len(batch), max_len, dtype=torch.int64)
     mask = torch.zeros(len(batch), max_len, dtype=torch.bool)
@@ -236,10 +303,10 @@ def collate_piece_union(batch: list[dict]) -> dict:
     for idx, item in enumerate(batch):
         length = item["length"]
         features[idx, :length] = torch.from_numpy(item["features"])
-        labels[idx, :length] = torch.from_numpy(item["labels"])
-        union_labels[idx, :length] = torch.from_numpy(item["union_labels"])
-        frequency_target[idx, :length] = torch.from_numpy(item["frequency_target"])
-        performer_count[idx, :length] = torch.from_numpy(item["performer_count"])
+        any_frequency[idx, :length] = torch.from_numpy(item["any_frequency"])
+        union_target[idx, :length] = torch.from_numpy(item["union_target"])
+        stage_frequency[idx, :length] = torch.from_numpy(item["stage_frequency"])
+        dominant_stage[idx, :length] = torch.from_numpy(item["dominant_stage"])
         loss_weights[idx, :length] = torch.from_numpy(item["loss_weights"])
         beat_idx[idx, :length] = torch.from_numpy(item["beat_idx"])
         mask[idx, :length] = True
@@ -248,10 +315,10 @@ def collate_piece_union(batch: list[dict]) -> dict:
 
     return {
         "features": features,
-        "labels": labels,
-        "union_labels": union_labels,
-        "frequency_target": frequency_target,
-        "performer_count": performer_count,
+        "any_frequency": any_frequency,
+        "union_target": union_target,
+        "stage_frequency": stage_frequency,
+        "dominant_stage": dominant_stage,
         "loss_weights": loss_weights,
         "beat_idx": beat_idx,
         "mask": mask,
@@ -269,11 +336,7 @@ def compute_normalizer(samples: list[dict]) -> tuple[np.ndarray, np.ndarray]:
     return mean, std
 
 
-def piece_samples_from_frame(
-    df: pd.DataFrame,
-    feature_cols: list[str],
-    split: str,
-) -> list[dict]:
+def piece_samples_from_frame(df: pd.DataFrame, feature_cols: list[str], split: str) -> list[dict]:
     subset = df[df["protocol_split"] == split].copy().sort_values(["piece_sample_id", "beat_idx"])
     samples = []
     for sample_id, group in subset.groupby("piece_sample_id", sort=False):
@@ -283,58 +346,135 @@ def piece_samples_from_frame(
                 "piece_id": group["piece_id"].iloc[0],
                 "beat_idx": group["beat_idx"].to_numpy(dtype=np.int32),
                 "features": group[feature_cols].to_numpy(dtype=np.float32),
+                "any_frequency": group["any_frequency"].to_numpy(dtype=np.float32),
                 "union_target": group["union_target"].to_numpy(dtype=np.float32),
-                "frequency_target": group["frequency_target"].to_numpy(dtype=np.float32),
-                "performer_count": group["performer_count"].to_numpy(dtype=np.int32),
+                "stage_frequency": group[["low_frequency", "mid_frequency", "high_frequency"]].to_numpy(dtype=np.float32),
+                "dominant_stage": group["dominant_stage"].to_numpy(dtype=np.int64),
             }
         )
     return samples
 
 
-def train_one_epoch(model, loader, optimizer, device, loss_fn, grad_clip: float, log_interval: int = 0) -> float:
+def soft_cross_entropy_from_distribution(
+    logits: torch.Tensor,
+    stage_frequency: torch.Tensor,
+    positive_mask: torch.Tensor,
+) -> torch.Tensor:
+    stage_sum = stage_frequency.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+    stage_dist = stage_frequency / stage_sum
+    log_probs = torch.log_softmax(logits, dim=-1)
+    per_token = -(stage_dist * log_probs).sum(dim=-1)
+    valid = positive_mask.float()
+    return (per_token * valid).sum() / valid.sum().clamp(min=1.0)
+
+
+def compute_mass_loss(
+    detector_logits: torch.Tensor,
+    stage_logits: torch.Tensor,
+    stage_frequency: torch.Tensor,
+    positive_mask: torch.Tensor,
+    class_weights: torch.Tensor,
+) -> torch.Tensor:
+    detector_prob = torch.sigmoid(detector_logits).unsqueeze(-1)
+    stage_prob = torch.softmax(stage_logits, dim=-1)
+    stage_mass_pred = detector_prob * stage_prob
+    per_class = torch.nn.functional.smooth_l1_loss(stage_mass_pred, stage_frequency, reduction="none")
+    per_class = per_class * class_weights.view(1, 1, -1)
+    per_token = per_class.sum(dim=-1)
+    valid = positive_mask.float()
+    return (per_token * valid).sum() / valid.sum().clamp(min=1.0)
+
+
+def train_one_epoch(
+    model: nn.Module,
+    loader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    detector_loss_fn: nn.Module,
+    mass_class_weights: torch.Tensor,
+    stage_soft_loss_weight: float,
+    stage_mass_loss_weight: float,
+    grad_clip: float,
+    log_interval: int = 0,
+) -> tuple[float, float, float, float]:
     model.train()
     total_loss = 0.0
+    total_detector_loss = 0.0
+    total_stage_soft_loss = 0.0
+    total_stage_mass_loss = 0.0
     total_tokens = 0
+    total_positive_tokens = 0
     for batch_idx, batch in enumerate(loader, start=1):
         features = batch["features"].to(device)
-        labels = batch["labels"].to(device)
+        any_frequency = batch["any_frequency"].to(device)
+        union_target = batch["union_target"].to(device)
+        stage_frequency = batch["stage_frequency"].to(device)
         loss_weights = batch["loss_weights"].to(device)
         mask = batch["mask"].to(device)
         lengths = batch["lengths"].to(device)
+        positive_mask = (union_target > 0.5) & mask
 
         optimizer.zero_grad()
-        logits = model(features, lengths=lengths)
-        loss = loss_fn(logits, labels)
+        detector_logits, stage_logits = model(features, lengths=lengths)
+
+        detector_loss = detector_loss_fn(detector_logits, any_frequency)
         token_weights = mask.float() * loss_weights
-        loss = (loss * token_weights).sum() / token_weights.sum().clamp(min=1.0)
-        loss.backward()
+        detector_loss = (detector_loss * token_weights).sum() / token_weights.sum().clamp(min=1.0)
+
+        stage_soft_loss = soft_cross_entropy_from_distribution(stage_logits, stage_frequency, positive_mask)
+        stage_mass_loss = compute_mass_loss(
+            detector_logits=detector_logits,
+            stage_logits=stage_logits,
+            stage_frequency=stage_frequency,
+            positive_mask=positive_mask,
+            class_weights=mass_class_weights,
+        )
+
+        total = detector_loss + float(stage_soft_loss_weight) * stage_soft_loss + float(stage_mass_loss_weight) * stage_mass_loss
+        total.backward()
         if grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
 
-        total_loss += float(loss.item()) * int(mask.sum().item())
-        total_tokens += int(mask.sum().item())
+        token_count = int(mask.sum().item())
+        positive_count = int(positive_mask.sum().item())
+        total_loss += float(total.item()) * token_count
+        total_detector_loss += float(detector_loss.item()) * token_count
+        total_stage_soft_loss += float(stage_soft_loss.item()) * max(positive_count, 1)
+        total_stage_mass_loss += float(stage_mass_loss.item()) * max(positive_count, 1)
+        total_tokens += token_count
+        total_positive_tokens += positive_count
         if log_interval > 0 and batch_idx % log_interval == 0:
-            running_loss = total_loss / max(total_tokens, 1)
-            print(f"  step {batch_idx}/{len(loader)} | running_loss {running_loss:.4f}")
-    return total_loss / max(total_tokens, 1)
+            running = total_loss / max(total_tokens, 1)
+            print(f"  step {batch_idx}/{len(loader)} | running_loss {running:.4f}")
+
+    return (
+        total_loss / max(total_tokens, 1),
+        total_detector_loss / max(total_tokens, 1),
+        total_stage_soft_loss / max(total_positive_tokens, 1),
+        total_stage_mass_loss / max(total_positive_tokens, 1),
+    )
 
 
 @torch.no_grad()
-def predict_detector(model, loader, device) -> pd.DataFrame:
+def predict(model: nn.Module, loader: DataLoader, device: torch.device) -> pd.DataFrame:
     model.eval()
     rows = []
     for batch in loader:
         features = batch["features"].to(device)
-        labels = batch["labels"].to(device)
-        union_labels = batch["union_labels"].to(device)
-        frequency_target = batch["frequency_target"].to(device)
-        performer_count = batch["performer_count"].to(device)
+        any_frequency = batch["any_frequency"].to(device)
+        union_target = batch["union_target"].to(device)
+        stage_frequency = batch["stage_frequency"].to(device)
+        dominant_stage = batch["dominant_stage"].to(device)
         beat_idx = batch["beat_idx"].to(device)
         mask = batch["mask"].to(device)
         lengths = batch["lengths"].to(device)
-        logits = model(features, lengths=lengths)
-        probs = torch.sigmoid(logits)
+
+        detector_logits, stage_logits = model(features, lengths=lengths)
+        detector_scores = torch.sigmoid(detector_logits)
+        stage_probs = torch.softmax(stage_logits, dim=-1)
+        pred_stage = stage_probs.argmax(dim=-1) + 1
+
         for batch_idx_i, sample_id in enumerate(batch["sample_ids"]):
             length = int(mask[batch_idx_i].sum().item())
             for pos in range(length):
@@ -343,11 +483,17 @@ def predict_detector(model, loader, device) -> pd.DataFrame:
                         "sample_id": sample_id,
                         "piece_id": batch["piece_ids"][batch_idx_i],
                         "beat_idx": int(beat_idx[batch_idx_i, pos].item()),
-                        "union_target": float(union_labels[batch_idx_i, pos].item()),
-                        "frequency_target": float(frequency_target[batch_idx_i, pos].item()),
-                        "performer_count": int(performer_count[batch_idx_i, pos].item()),
-                        "detector_score": float(probs[batch_idx_i, pos].item()),
-                        "train_label": float(labels[batch_idx_i, pos].item()),
+                        "any_frequency": float(any_frequency[batch_idx_i, pos].item()),
+                        "union_target": float(union_target[batch_idx_i, pos].item()),
+                        "dominant_stage": int(dominant_stage[batch_idx_i, pos].item()),
+                        "detector_score": float(detector_scores[batch_idx_i, pos].item()),
+                        "pred_stage_class": int(pred_stage[batch_idx_i, pos].item()),
+                        "low_frequency": float(stage_frequency[batch_idx_i, pos, 0].item()),
+                        "mid_frequency": float(stage_frequency[batch_idx_i, pos, 1].item()),
+                        "high_frequency": float(stage_frequency[batch_idx_i, pos, 2].item()),
+                        "pred_stage_prob_1": float(stage_probs[batch_idx_i, pos, 0].item()),
+                        "pred_stage_prob_2": float(stage_probs[batch_idx_i, pos, 1].item()),
+                        "pred_stage_prob_3": float(stage_probs[batch_idx_i, pos, 2].item()),
                     }
                 )
     return pd.DataFrame(rows)
@@ -361,7 +507,7 @@ def detector_sequence_maps(pred_df: pd.DataFrame) -> tuple[dict[str, np.ndarray]
     for sample_id, group in ordered.groupby("sample_id", sort=False):
         sequence_scores[sample_id] = group["detector_score"].to_numpy(dtype=np.float32)
         sequence_union[sample_id] = group["union_target"].to_numpy(dtype=np.float32)
-        sequence_frequency[sample_id] = group["frequency_target"].to_numpy(dtype=np.float32)
+        sequence_frequency[sample_id] = group["any_frequency"].to_numpy(dtype=np.float32)
     return sequence_scores, sequence_union, sequence_frequency
 
 
@@ -397,44 +543,6 @@ def labeled_metrics_to_dict(metrics) -> dict:
     }
 
 
-def train_stage_grader(
-    train_df: pd.DataFrame,
-    val_df: pd.DataFrame,
-    feature_cols: list[str],
-    seed: int,
-) -> tuple[dict, pd.DataFrame]:
-    labels = [1, 2, 3]
-    train_pos = train_df[train_df["dominant_stage"] > 0].copy()
-    val_pos = val_df[val_df["dominant_stage"] > 0].copy()
-    if train_pos.empty or val_pos.empty:
-        raise ValueError("Stage grading requires positive low/mid/high labels in both train and val splits")
-
-    scaler = StandardScaler()
-    x_train = scaler.fit_transform(train_pos[feature_cols].to_numpy(dtype=np.float32))
-    y_train = train_pos["dominant_stage"].to_numpy(dtype=np.int64)
-    x_val_pos = scaler.transform(val_pos[feature_cols].to_numpy(dtype=np.float32))
-    y_val_pos = val_pos["dominant_stage"].to_numpy(dtype=np.int64)
-
-    clf = LogisticRegression(
-        max_iter=4000,
-        class_weight="balanced",
-        random_state=seed,
-    )
-    clf.fit(x_train, y_train)
-
-    oracle_pred = clf.predict(x_val_pos).astype(np.int64)
-    oracle_metrics = grading_report(y_true=y_val_pos, y_pred=oracle_pred, labels=labels)
-
-    val_all = val_df.copy()
-    x_val_all = scaler.transform(val_all[feature_cols].to_numpy(dtype=np.float32))
-    pred_all = clf.predict(x_val_all).astype(np.int64)
-    prob_all = clf.predict_proba(x_val_all)
-    val_all["pred_stage_class"] = pred_all.astype(np.int64)
-    for class_idx, label in enumerate(clf.classes_.tolist()):
-        val_all[f"pred_stage_prob_{int(label)}"] = prob_all[:, class_idx].astype(np.float32)
-    return oracle_metrics, val_all
-
-
 def union_metrics_to_dict(metrics) -> dict:
     return {
         "threshold": metrics.threshold,
@@ -454,7 +562,7 @@ def union_metrics_to_dict(metrics) -> dict:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Piece-level union/frequency detector protocol.")
+    parser = argparse.ArgumentParser(description="Piece-level union/frequency multitask detector+stage model.")
     parser.add_argument("--config", required=True)
     parser.add_argument("--heldout_piece", nargs="+", required=True)
     parser.add_argument("--train_pieces", nargs="*", default=None)
@@ -466,21 +574,13 @@ def main():
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--log_interval", type=int, default=0)
     parser.add_argument("--output_dir", default=None)
-    parser.add_argument(
-        "--detector_target",
-        choices=["any_boundary", "midhigh_boundary", "low_boundary", "mid_boundary", "high_boundary"],
-        default="midhigh_boundary",
-    )
     parser.add_argument("--min_precision", type=float, default=0.85)
+    parser.add_argument("--consensus_threshold", type=float, default=None)
     parser.add_argument("--hard_negative_radius", type=int, default=0)
     parser.add_argument("--hard_negative_weight", type=float, default=1.0)
     parser.add_argument("--easy_negative_weight", type=float, default=1.0)
-    parser.add_argument(
-        "--selection_metric",
-        choices=["weighted_recall", "union_recall", "consensus_recall"],
-        default="weighted_recall",
-    )
-    parser.add_argument("--skip_stage_grading", action="store_true")
+    parser.add_argument("--stage_soft_loss_weight", type=float, default=1.0)
+    parser.add_argument("--stage_mass_loss_weight", type=float, default=1.0)
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -503,17 +603,15 @@ def main():
     else:
         out_root = resolve_path(
             cfg,
-            f"../outputs/piece_union_protocol/{heldout_slug}/{args.model}_{args.detector_target}_xml_curated_p{int(round(args.min_precision * 100))}{hardneg_suffix}",
+            f"../outputs/piece_union_multitask/{heldout_slug}/{args.model}_any_boundary_xml_curated_p{int(round(args.min_precision * 100))}{hardneg_suffix}",
         )
     out_root.mkdir(parents=True, exist_ok=True)
 
     df = load_table(table_path)
     df = apply_piece_protocol_split(df, heldout_pieces=args.heldout_piece, train_pieces=args.train_pieces)
     df = df[df["protocol_split"].isin(["train", "val"])].copy()
-    all_feature_cols = feature_columns(df)
-    feature_cols = select_feature_columns(cfg, all_feature_cols)
-    grader_feature_cols = select_grader_feature_columns(cfg, feature_cols, all_feature_cols)
-    piece_df = build_piece_union_frame(df, feature_cols=feature_cols, target_mode=args.detector_target)
+    feature_cols = select_feature_columns(cfg, feature_columns(df))
+    piece_df = build_piece_union_frame(df, feature_cols=feature_cols)
 
     train_samples = piece_samples_from_frame(piece_df, feature_cols, split="train")
     val_samples = piece_samples_from_frame(piece_df, feature_cols, split="val")
@@ -521,7 +619,7 @@ def main():
         raise ValueError("Protocol split produced an empty train or val set")
 
     mean, std = compute_normalizer(train_samples)
-    train_ds = PieceUnionDataset(
+    train_ds = PieceUnionMultitaskDataset(
         train_samples,
         mean=mean,
         std=std,
@@ -529,29 +627,35 @@ def main():
         hard_negative_weight=float(args.hard_negative_weight),
         easy_negative_weight=float(args.easy_negative_weight),
     )
-    val_ds = PieceUnionDataset(val_samples, mean=mean, std=std)
+    val_ds = PieceUnionMultitaskDataset(val_samples, mean=mean, std=std)
     batch_size = int(args.batch_size or seq_cfg.get("batch_size", 64))
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=collate_piece_union)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_piece_union)
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=collate_multitask)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_multitask)
 
-    model = build_sequence_model(args.model, input_dim=len(feature_cols), cfg=cfg, output_dim=1).to(device)
+    model = build_multitask_model(args.model, input_dim=len(feature_cols), cfg=cfg).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=float(seq_cfg.get("lr", 1e-3)),
         weight_decay=float(seq_cfg.get("weight_decay", 1e-4)),
     )
 
-    train_labels = np.concatenate([sample["frequency_target"] for sample in train_samples], axis=0)
-    pos = float(train_labels.sum())
-    neg = float(train_labels.shape[0] - pos)
-    pos_weight = torch.tensor([neg / max(pos, 1.0)], device=device, dtype=torch.float32)
-    loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight, reduction="none")
+    train_any = np.concatenate([sample["any_frequency"] for sample in train_samples], axis=0)
+    pos = float(train_any.sum())
+    neg = float(train_any.shape[0] - pos)
+    detector_pos_weight = torch.tensor([neg / max(pos, 1.0)], device=device, dtype=torch.float32)
+    detector_loss_fn = nn.BCEWithLogitsLoss(pos_weight=detector_pos_weight, reduction="none")
+
+    stage_mass = np.concatenate([sample["stage_frequency"] for sample in train_samples], axis=0)
+    class_mass = stage_mass.sum(axis=0).astype(np.float32)
+    class_mass[class_mass < 1e-6] = 1.0
+    mass_class_weights = torch.tensor(class_mass.sum() / class_mass, device=device, dtype=torch.float32)
+    mass_class_weights = mass_class_weights / mass_class_weights.mean().clamp(min=1e-6)
 
     thresholds = threshold_grid(cfg)
     tolerance = int(eval_cfg.get("event_tolerance", 1))
     min_distance = int(eval_cfg.get("min_distance", 6))
     prominence = float(eval_cfg.get("prominence", 0.0))
-    consensus_threshold = float(eval_cfg.get("consensus_threshold", 0.5))
+    consensus_threshold = float(args.consensus_threshold if args.consensus_threshold is not None else eval_cfg.get("consensus_threshold", 0.5))
     epochs = int(args.epochs or seq_cfg.get("epochs", 30))
     patience = int(args.early_stop_patience if args.early_stop_patience is not None else seq_cfg.get("early_stop_patience", 5))
     grad_clip = float(seq_cfg.get("grad_clip", 1.0))
@@ -559,23 +663,28 @@ def main():
     best_epoch = 0
     best_key = None
     best_metrics = None
-    best_val_pred = None
+    best_pred = None
+    best_oracle = None
+    best_stage_event = None
     history = []
     bad_epochs = 0
 
     for epoch in range(1, epochs + 1):
-        train_loss = train_one_epoch(
+        train_loss, train_detector_loss, train_stage_soft_loss, train_stage_mass_loss = train_one_epoch(
             model=model,
             loader=train_loader,
             optimizer=optimizer,
             device=device,
-            loss_fn=loss_fn,
+            detector_loss_fn=detector_loss_fn,
+            mass_class_weights=mass_class_weights,
+            stage_soft_loss_weight=float(args.stage_soft_loss_weight),
+            stage_mass_loss_weight=float(args.stage_mass_loss_weight),
             grad_clip=grad_clip,
             log_interval=max(int(args.log_interval), 0),
         )
-        val_pred = predict_detector(model, val_loader, device=device)
+        val_pred = predict(model, val_loader, device=device)
         sequence_scores, sequence_union, sequence_frequency = detector_sequence_maps(val_pred)
-        metrics = search_union_frequency_threshold(
+        union_metrics = search_union_frequency_threshold(
             sequence_scores=sequence_scores,
             sequence_union_labels=sequence_union,
             sequence_frequency_targets=sequence_frequency,
@@ -586,47 +695,69 @@ def main():
             consensus_threshold=consensus_threshold,
             prominence=prominence,
         )
-        precision_floor_met = metrics.union_precision >= float(args.min_precision)
+        precision_floor_met = union_metrics.union_precision >= float(args.min_precision)
+
+        pos_val = val_pred[val_pred["dominant_stage"] > 0].copy()
+        oracle_grading = grading_report(
+            y_true=pos_val["dominant_stage"].to_numpy(dtype=np.int64),
+            y_pred=pos_val["pred_stage_class"].to_numpy(dtype=np.int64),
+            labels=[1, 2, 3],
+        )
+
+        sequence_pred_labels = {}
+        sequence_true_labels = {}
+        for sample_id, group in val_pred.sort_values(["sample_id", "beat_idx"]).groupby("sample_id", sort=False):
+            sequence_pred_labels[sample_id] = group["pred_stage_class"].to_numpy(dtype=np.int32)
+            sequence_true_labels[sample_id] = group["dominant_stage"].to_numpy(dtype=np.int32)
+        stage_event_metrics = evaluate_labeled_event_sequences(
+            sequence_scores=sequence_scores,
+            sequence_pred_labels=sequence_pred_labels,
+            sequence_true_labels=sequence_true_labels,
+            positive_classes=(1, 2, 3),
+            threshold=float(union_metrics.threshold),
+            tolerance=tolerance,
+            min_distance=min_distance,
+            prominence=prominence,
+        )
+
         history.append(
             {
                 "epoch": epoch,
                 "train_loss": train_loss,
-                "union_precision": metrics.union_precision,
-                "union_recall": metrics.union_recall,
-                "union_f1": metrics.union_f1,
-                "weighted_recall": metrics.weighted_recall,
-                "consensus_recall": metrics.consensus_recall,
-                "best_threshold": metrics.threshold,
+                "train_detector_loss": train_detector_loss,
+                "train_stage_soft_loss": train_stage_soft_loss,
+                "train_stage_mass_loss": train_stage_mass_loss,
+                "union_precision": union_metrics.union_precision,
+                "weighted_recall": union_metrics.weighted_recall,
+                "consensus_recall": union_metrics.consensus_recall,
+                "oracle_stage_macro_f1": oracle_grading["macro_f1"],
+                "end_to_end_stage_macro_f1": stage_event_metrics.macro_f1,
+                "best_threshold": union_metrics.threshold,
                 "precision_floor_met": precision_floor_met,
             }
         )
         print(
             f"Epoch {epoch}/{epochs} | train_loss {train_loss:.4f} | "
-            f"union_precision {metrics.union_precision:.4f} | weighted_recall {metrics.weighted_recall:.4f} | "
-            f"consensus_recall {metrics.consensus_recall:.4f} | threshold {metrics.threshold:.3f}"
+            f"union_precision {union_metrics.union_precision:.4f} | weighted_recall {union_metrics.weighted_recall:.4f} | "
+            f"oracle_f1 {oracle_grading['macro_f1']:.4f} | e2e_f1 {stage_event_metrics.macro_f1:.4f}"
         )
-
-        if args.selection_metric == "union_recall":
-            primary_metric = metrics.union_recall
-        elif args.selection_metric == "consensus_recall":
-            primary_metric = metrics.consensus_recall
-        else:
-            primary_metric = metrics.weighted_recall
 
         current_key = (
             float(precision_floor_met),
-            primary_metric if precision_floor_met else metrics.union_precision,
-            metrics.union_precision,
-            metrics.weighted_recall,
-            metrics.consensus_recall,
-            metrics.union_f1,
-            -float(metrics.mean_offset or 1e9),
+            union_metrics.weighted_recall if precision_floor_met else union_metrics.union_precision,
+            union_metrics.union_precision,
+            stage_event_metrics.macro_f1,
+            oracle_grading["macro_f1"],
+            union_metrics.consensus_recall,
+            -float(union_metrics.mean_offset or 1e9),
         )
         if best_key is None or current_key > best_key:
             best_key = current_key
             best_epoch = epoch
-            best_metrics = metrics
-            best_val_pred = val_pred.copy()
+            best_metrics = union_metrics
+            best_pred = val_pred.copy()
+            best_oracle = oracle_grading
+            best_stage_event = stage_event_metrics
             bad_epochs = 0
             torch.save(
                 {
@@ -636,12 +767,13 @@ def main():
                     "mean": mean,
                     "std": std,
                     "best_epoch": best_epoch,
-                    "detector_target": args.detector_target,
-                    "best_threshold": metrics.threshold,
+                    "best_threshold": union_metrics.threshold,
                     "min_precision": args.min_precision,
                     "consensus_threshold": consensus_threshold,
+                    "stage_soft_loss_weight": args.stage_soft_loss_weight,
+                    "stage_mass_loss_weight": args.stage_mass_loss_weight,
                 },
-                out_root / "detector_best.pt",
+                out_root / "best.pt",
             )
         else:
             bad_epochs += 1
@@ -649,54 +781,14 @@ def main():
                 print(f"Early stopping at epoch {epoch}")
                 break
 
-    if best_metrics is None or best_val_pred is None:
-        raise RuntimeError("Detector training did not produce validation metrics")
+    if best_metrics is None or best_pred is None or best_oracle is None or best_stage_event is None:
+        raise RuntimeError("Multitask training did not produce validation metrics")
+
+    best_pred.to_csv(out_root / "val_predictions.csv.gz", index=False, compression="gzip")
+    np.savez(out_root / "scaler_stats.npz", mean=mean, std=std)
 
     train_df = piece_df[piece_df["protocol_split"] == "train"].copy()
     val_df = piece_df[piece_df["protocol_split"] == "val"].copy()
-    oracle_stage_grading = None
-    class_event_metrics = None
-    if args.skip_stage_grading:
-        merged_val = best_val_pred.copy()
-    else:
-        oracle_stage_grading, graded_val = train_stage_grader(
-            train_df=train_df,
-            val_df=val_df,
-            feature_cols=grader_feature_cols,
-            seed=seed,
-        )
-        prob_cols = [col for col in graded_val.columns if col.startswith("pred_stage_prob_")]
-        merged_val = best_val_pred.merge(
-            graded_val[["piece_sample_id", "piece_id", "beat_idx", "dominant_stage", "pred_stage_class", *prob_cols]].rename(
-                columns={"piece_sample_id": "sample_id"}
-            ),
-            on=["sample_id", "piece_id", "beat_idx"],
-            how="left",
-            validate="one_to_one",
-        )
-
-        sequence_scores = {}
-        sequence_pred_labels = {}
-        sequence_true_labels = {}
-        for sample_id, group in merged_val.sort_values(["sample_id", "beat_idx"]).groupby("sample_id", sort=False):
-            sequence_scores[sample_id] = group["detector_score"].to_numpy(dtype=np.float32)
-            sequence_pred_labels[sample_id] = group["pred_stage_class"].fillna(0).to_numpy(dtype=np.int32)
-            sequence_true_labels[sample_id] = group["dominant_stage"].fillna(0).to_numpy(dtype=np.int32)
-
-        class_event_metrics = evaluate_labeled_event_sequences(
-            sequence_scores=sequence_scores,
-            sequence_pred_labels=sequence_pred_labels,
-            sequence_true_labels=sequence_true_labels,
-            positive_classes=(1, 2, 3),
-            threshold=float(best_metrics.threshold),
-            tolerance=tolerance,
-            min_distance=min_distance,
-            prominence=prominence,
-        )
-
-    merged_val.to_csv(out_root / "val_predictions.csv.gz", index=False, compression="gzip")
-    np.savez(out_root / "detector_scaler_stats.npz", mean=mean, std=std)
-
     summary = {
         "table_path": str(table_path),
         "heldout_pieces": list(args.heldout_piece),
@@ -705,7 +797,6 @@ def main():
         "train_sequence_count": int(train_df["piece_sample_id"].nunique()),
         "val_sequence_count": int(val_df["piece_sample_id"].nunique()),
         "model_type": args.model,
-        "detector_target": args.detector_target,
         "seed": seed,
         "device": str(device),
         "best_epoch": best_epoch,
@@ -716,37 +807,33 @@ def main():
         "hard_negative_radius": int(args.hard_negative_radius),
         "hard_negative_weight": float(args.hard_negative_weight),
         "easy_negative_weight": float(args.easy_negative_weight),
-        "selection_metric": str(args.selection_metric),
-        "skip_stage_grading": bool(args.skip_stage_grading),
+        "stage_soft_loss_weight": float(args.stage_soft_loss_weight),
+        "stage_mass_loss_weight": float(args.stage_mass_loss_weight),
         "precision_floor_met": bool(best_metrics.union_precision >= float(args.min_precision)),
         "union_metrics": union_metrics_to_dict(best_metrics),
+        "oracle_stage_grading": {
+            "target": "dominant_stage",
+            **best_oracle,
+        },
+        "end_to_end_stage": labeled_metrics_to_dict(best_stage_event),
         "feature_columns": feature_cols,
-        "grader_feature_columns": grader_feature_cols,
         "history": history,
     }
-    if oracle_stage_grading is not None:
-        summary["oracle_stage_grading"] = {
-            "target": "dominant_stage",
-            **oracle_stage_grading,
-        }
-    if class_event_metrics is not None:
-        summary["end_to_end_stage"] = labeled_metrics_to_dict(class_event_metrics)
     (out_root / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     print(
         f"Held-out {heldout_slug} | union_precision={best_metrics.union_precision:.4f} | "
         f"weighted_recall={best_metrics.weighted_recall:.4f} | consensus_recall={best_metrics.consensus_recall:.4f}"
     )
-    if oracle_stage_grading is not None and class_event_metrics is not None:
-        print(
-            f"  oracle_stage_macro_f1={oracle_stage_grading['macro_f1']:.4f} | "
-            f"end_to_end_stage_macro_f1={class_event_metrics.macro_f1:.4f}"
-        )
-        print(
-            "  end_to_end_stage_class_f1="
-            f"low:{class_event_metrics.class_f1.get(1, 0.0):.4f},"
-            f"mid:{class_event_metrics.class_f1.get(2, 0.0):.4f},"
-            f"high:{class_event_metrics.class_f1.get(3, 0.0):.4f}"
-        )
+    print(
+        f"  oracle_stage_macro_f1={best_oracle['macro_f1']:.4f} | "
+        f"end_to_end_stage_macro_f1={best_stage_event.macro_f1:.4f}"
+    )
+    print(
+        "  end_to_end_stage_class_f1="
+        f"low:{best_stage_event.class_f1.get(1, 0.0):.4f},"
+        f"mid:{best_stage_event.class_f1.get(2, 0.0):.4f},"
+        f"high:{best_stage_event.class_f1.get(3, 0.0):.4f}"
+    )
 
 
 if __name__ == "__main__":

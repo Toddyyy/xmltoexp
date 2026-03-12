@@ -709,6 +709,16 @@ def main():
         f"Held-out {heldout_slug} | union_precision={best_metrics.union_precision:.4f} | "
         f"weighted_recall={best_metrics.weighted_recall:.4f} | consensus_recall={best_metrics.consensus_recall:.4f}"
     )
+    print(
+        f"  oracle_stage_macro_f1={oracle_stage_grading['macro_f1']:.4f} | "
+        f"end_to_end_stage_macro_f1={class_event_metrics.macro_f1:.4f}"
+    )
+    print(
+        "  end_to_end_stage_class_f1="
+        f"low:{class_event_metrics.class_f1.get(1, 0.0):.4f},"
+        f"mid:{class_event_metrics.class_f1.get(2, 0.0):.4f},"
+        f"high:{class_event_metrics.class_f1.get(3, 0.0):.4f}"
+    )
 
 
 if __name__ == "__main__":

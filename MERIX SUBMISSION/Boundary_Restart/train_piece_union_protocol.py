@@ -10,11 +10,14 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score, classification_report, f1_score
+from sklearn.preprocessing import StandardScaler
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
 from boundary_restart.config import load_config, resolve_path, threshold_grid
-from boundary_restart.metrics import search_union_frequency_threshold
+from boundary_restart.metrics import evaluate_labeled_event_sequences, search_union_frequency_threshold
 from boundary_restart.models import build_sequence_model
 from boundary_restart.table_io import feature_columns, load_table
 
@@ -47,6 +50,24 @@ def select_feature_columns(cfg: dict, columns: list[str]) -> list[str]:
     if exclude:
         selected = [col for col in selected if col not in exclude]
     return [col for col in selected if col != "protocol_split"]
+
+
+def select_grader_feature_columns(cfg: dict, detector_cols: list[str], all_columns: list[str]) -> list[str]:
+    feature_cfg = cfg.get("features", {})
+    grader_include = feature_cfg.get("grader_include")
+    grader_extra_include = feature_cfg.get("grader_extra_include")
+    if grader_include:
+        include_set = set(grader_include)
+        return [col for col in all_columns if col in include_set and col != "protocol_split"]
+    if grader_extra_include:
+        selected = list(detector_cols)
+        existing = set(selected)
+        for col in grader_extra_include:
+            if col in all_columns and col not in existing and col != "protocol_split":
+                selected.append(col)
+                existing.add(col)
+        return selected
+    return list(detector_cols)
 
 
 def detector_labels(stage_class: np.ndarray, mode: str) -> np.ndarray:
@@ -111,10 +132,16 @@ def build_loss_weights(
 def build_piece_union_frame(df: pd.DataFrame, feature_cols: list[str], target_mode: str) -> pd.DataFrame:
     frame = df.copy()
     frame["detector_binary"] = detector_labels(frame["stage_class"].to_numpy(dtype=np.int64), mode=target_mode)
+    frame["low_binary"] = (frame["stage_class"].to_numpy(dtype=np.int64) == 1).astype(np.float32)
+    frame["mid_binary"] = (frame["stage_class"].to_numpy(dtype=np.int64) == 2).astype(np.float32)
+    frame["high_binary"] = (frame["stage_class"].to_numpy(dtype=np.int64) >= 3).astype(np.float32)
     agg_spec: dict[str, str] = {
         "protocol_split": "first",
         "num_beats": "first",
         "detector_binary": "mean",
+        "low_binary": "mean",
+        "mid_binary": "mean",
+        "high_binary": "mean",
         "sample_id": pd.Series.nunique,
     }
     for col in feature_cols:
@@ -128,6 +155,17 @@ def build_piece_union_frame(df: pd.DataFrame, feature_cols: list[str], target_mo
         .reset_index()
     )
     piece["union_target"] = (piece["frequency_target"] > 0.0).astype(np.float32)
+    piece = piece.rename(
+        columns={
+            "low_binary": "low_frequency",
+            "mid_binary": "mid_frequency",
+            "high_binary": "high_frequency",
+        }
+    )
+    stage_freq = piece[["low_frequency", "mid_frequency", "high_frequency"]].to_numpy(dtype=np.float32)
+    dominant_idx = np.argmax(stage_freq, axis=1) + 1
+    dominant_idx = np.where(piece["union_target"].to_numpy(dtype=np.float32) > 0.0, dominant_idx, 0)
+    piece["dominant_stage"] = dominant_idx.astype(np.int64)
     piece["piece_sample_id"] = piece["piece_id"]
     return piece
 
@@ -321,6 +359,76 @@ def detector_sequence_maps(pred_df: pd.DataFrame) -> tuple[dict[str, np.ndarray]
     return sequence_scores, sequence_union, sequence_frequency
 
 
+def grading_report(y_true: np.ndarray, y_pred: np.ndarray, labels: list[int]) -> dict:
+    report = classification_report(y_true, y_pred, labels=labels, output_dict=True, zero_division=0)
+    return {
+        "accuracy": float(accuracy_score(y_true, y_pred)),
+        "macro_f1": float(f1_score(y_true, y_pred, labels=labels, average="macro", zero_division=0)),
+        "weighted_f1": float(f1_score(y_true, y_pred, labels=labels, average="weighted", zero_division=0)),
+        "class_f1": {str(label): float(report[str(label)]["f1-score"]) for label in labels},
+        "class_precision": {str(label): float(report[str(label)]["precision"]) for label in labels},
+        "class_recall": {str(label): float(report[str(label)]["recall"]) for label in labels},
+        "class_support": {str(label): int(report[str(label)]["support"]) for label in labels},
+    }
+
+
+def labeled_metrics_to_dict(metrics) -> dict:
+    return {
+        "threshold": metrics.threshold,
+        "macro_precision": metrics.macro_precision,
+        "macro_recall": metrics.macro_recall,
+        "macro_f1": metrics.macro_f1,
+        "micro_precision": metrics.micro_precision,
+        "micro_recall": metrics.micro_recall,
+        "micro_f1": metrics.micro_f1,
+        "mean_offset": metrics.mean_offset,
+        "class_precision": {str(k): float(v) for k, v in metrics.class_precision.items()},
+        "class_recall": {str(k): float(v) for k, v in metrics.class_recall.items()},
+        "class_f1": {str(k): float(v) for k, v in metrics.class_f1.items()},
+        "class_matches": {str(k): int(v) for k, v in metrics.class_matches.items()},
+        "class_pred_events": {str(k): int(v) for k, v in metrics.class_pred_events.items()},
+        "class_true_events": {str(k): int(v) for k, v in metrics.class_true_events.items()},
+    }
+
+
+def train_stage_grader(
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    feature_cols: list[str],
+    seed: int,
+) -> tuple[dict, pd.DataFrame]:
+    labels = [1, 2, 3]
+    train_pos = train_df[train_df["dominant_stage"] > 0].copy()
+    val_pos = val_df[val_df["dominant_stage"] > 0].copy()
+    if train_pos.empty or val_pos.empty:
+        raise ValueError("Stage grading requires positive low/mid/high labels in both train and val splits")
+
+    scaler = StandardScaler()
+    x_train = scaler.fit_transform(train_pos[feature_cols].to_numpy(dtype=np.float32))
+    y_train = train_pos["dominant_stage"].to_numpy(dtype=np.int64)
+    x_val_pos = scaler.transform(val_pos[feature_cols].to_numpy(dtype=np.float32))
+    y_val_pos = val_pos["dominant_stage"].to_numpy(dtype=np.int64)
+
+    clf = LogisticRegression(
+        max_iter=4000,
+        class_weight="balanced",
+        random_state=seed,
+    )
+    clf.fit(x_train, y_train)
+
+    oracle_pred = clf.predict(x_val_pos).astype(np.int64)
+    oracle_metrics = grading_report(y_true=y_val_pos, y_pred=oracle_pred, labels=labels)
+
+    val_all = val_df.copy()
+    x_val_all = scaler.transform(val_all[feature_cols].to_numpy(dtype=np.float32))
+    pred_all = clf.predict(x_val_all).astype(np.int64)
+    prob_all = clf.predict_proba(x_val_all)
+    val_all["pred_stage_class"] = pred_all.astype(np.int64)
+    for class_idx, label in enumerate(clf.classes_.tolist()):
+        val_all[f"pred_stage_prob_{int(label)}"] = prob_all[:, class_idx].astype(np.float32)
+    return oracle_metrics, val_all
+
+
 def union_metrics_to_dict(metrics) -> dict:
     return {
         "threshold": metrics.threshold,
@@ -388,6 +496,7 @@ def main():
     df = df[df["protocol_split"].isin(["train", "val"])].copy()
     all_feature_cols = feature_columns(df)
     feature_cols = select_feature_columns(cfg, all_feature_cols)
+    grader_feature_cols = select_grader_feature_columns(cfg, feature_cols, all_feature_cols)
     piece_df = build_piece_union_frame(df, feature_cols=feature_cols, target_mode=args.detector_target)
 
     train_samples = piece_samples_from_frame(piece_df, feature_cols, split="train")
@@ -519,11 +628,52 @@ def main():
     if best_metrics is None or best_val_pred is None:
         raise RuntimeError("Detector training did not produce validation metrics")
 
-    best_val_pred.to_csv(out_root / "val_predictions.csv.gz", index=False, compression="gzip")
-    np.savez(out_root / "detector_scaler_stats.npz", mean=mean, std=std)
-
     train_df = piece_df[piece_df["protocol_split"] == "train"].copy()
     val_df = piece_df[piece_df["protocol_split"] == "val"].copy()
+    oracle_stage_grading, graded_val = train_stage_grader(
+        train_df=train_df,
+        val_df=val_df,
+        feature_cols=grader_feature_cols,
+        seed=seed,
+    )
+    merge_cols = [
+        "sample_id",
+        "piece_id",
+        "beat_idx",
+        "dominant_stage",
+        "pred_stage_class",
+    ]
+    prob_cols = [col for col in graded_val.columns if col.startswith("pred_stage_prob_")]
+    merged_val = best_val_pred.merge(
+        graded_val[["piece_sample_id", "piece_id", "beat_idx", "dominant_stage", "pred_stage_class", *prob_cols]].rename(
+            columns={"piece_sample_id": "sample_id"}
+        ),
+        on=["sample_id", "piece_id", "beat_idx"],
+        how="left",
+        validate="one_to_one",
+    )
+    merged_val.to_csv(out_root / "val_predictions.csv.gz", index=False, compression="gzip")
+    np.savez(out_root / "detector_scaler_stats.npz", mean=mean, std=std)
+
+    sequence_scores = {}
+    sequence_pred_labels = {}
+    sequence_true_labels = {}
+    for sample_id, group in merged_val.sort_values(["sample_id", "beat_idx"]).groupby("sample_id", sort=False):
+        sequence_scores[sample_id] = group["detector_score"].to_numpy(dtype=np.float32)
+        sequence_pred_labels[sample_id] = group["pred_stage_class"].fillna(0).to_numpy(dtype=np.int32)
+        sequence_true_labels[sample_id] = group["dominant_stage"].fillna(0).to_numpy(dtype=np.int32)
+
+    class_event_metrics = evaluate_labeled_event_sequences(
+        sequence_scores=sequence_scores,
+        sequence_pred_labels=sequence_pred_labels,
+        sequence_true_labels=sequence_true_labels,
+        positive_classes=(1, 2, 3),
+        threshold=float(best_metrics.threshold),
+        tolerance=tolerance,
+        min_distance=min_distance,
+        prominence=prominence,
+    )
+
     summary = {
         "table_path": str(table_path),
         "heldout_pieces": list(args.heldout_piece),
@@ -546,6 +696,12 @@ def main():
         "precision_floor_met": bool(best_metrics.union_precision >= float(args.min_precision)),
         "union_metrics": union_metrics_to_dict(best_metrics),
         "feature_columns": feature_cols,
+        "grader_feature_columns": grader_feature_cols,
+        "oracle_stage_grading": {
+            "target": "dominant_stage",
+            **oracle_stage_grading,
+        },
+        "end_to_end_stage": labeled_metrics_to_dict(class_event_metrics),
         "history": history,
     }
     (out_root / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")

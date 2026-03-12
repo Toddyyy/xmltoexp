@@ -13,10 +13,16 @@
 
 set -euo pipefail
 
-PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# On Slurm clusters, the script may execute from a spool copy. Prefer the
+# original submission directory so relative paths resolve against the repo.
+PROJECT_DIR="${SLURM_SUBMIT_DIR:-$(pwd)}"
 cd "$PROJECT_DIR"
 
 VENV_PATH="${VENV_PATH:-$PROJECT_DIR/../MIREX_Model/.venv}"
+if [ ! -f "$VENV_PATH/bin/activate" ]; then
+  echo "Missing virtualenv activate script: $VENV_PATH/bin/activate" >&2
+  exit 1
+fi
 source "$VENV_PATH/bin/activate"
 
 CONFIG="${CONFIG:-configs/salience_grouped3_hi8_score_only_xml_curated.yaml}"

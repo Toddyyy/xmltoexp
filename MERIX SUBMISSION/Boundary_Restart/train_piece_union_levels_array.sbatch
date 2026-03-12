@@ -1,9 +1,9 @@
 #!/bin/bash
-#SBATCH --job-name=br_union_levels_arr
+#SBATCH --job-name=br_union_level_arr
 #SBATCH --partition=gpua800
 #SBATCH --gres=gpu:1
 #SBATCH --qos=1a800
-#SBATCH --array=0-8
+#SBATCH --array=0-2
 #SBATCH --output=slurm-%x-%A_%a.out
 #SBATCH --error=slurm-%x-%A_%a.err
 #SBATCH --time=24:00:00
@@ -25,6 +25,7 @@ source "$VENV_PATH/bin/activate"
 
 CONFIG="${CONFIG:-configs/salience_grouped3_hi8_score_only_xml_curated.yaml}"
 MODEL="${MODEL:-tcn}"
+DETECTOR_TARGET="${DETECTOR_TARGET:-low_boundary}"
 MIN_PRECISION="${MIN_PRECISION:-0.85}"
 BATCH_SIZE="${BATCH_SIZE:-64}"
 EPOCHS="${EPOCHS:-30}"
@@ -33,12 +34,8 @@ SEED="${SEED:-42}"
 SELECTION_METRIC="${SELECTION_METRIC:-union_recall}"
 
 HELDOUT_PIECES=("M06-2" "M17-1" "M30-1")
-LEVEL_TARGETS=("low_boundary" "mid_boundary" "high_boundary")
 IDX="${SLURM_ARRAY_TASK_ID:-0}"
-PIECE_IDX=$(( IDX / 3 ))
-LEVEL_IDX=$(( IDX % 3 ))
-HELDOUT_PIECE="${HELDOUT_PIECES[$PIECE_IDX]}"
-DETECTOR_TARGET="${LEVEL_TARGETS[$LEVEL_IDX]}"
+HELDOUT_PIECE="${HELDOUT_PIECES[$IDX]}"
 
 OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_DIR/outputs/piece_union_protocol/${HELDOUT_PIECE}/${MODEL}_${DETECTOR_TARGET}_${SELECTION_METRIC}_p${MIN_PRECISION/./}_cuda}"
 

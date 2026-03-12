@@ -1,0 +1,13 @@
+PROJECT_DIR=/gpfs/work/int/yuxuanliu2204/Changheng/xmltoexp/MERIX SUBMISSION/Boundary_Restart
+VENV_PATH=/gpfs/work/int/yuxuanliu2204/Changheng/xmltoexp/MERIX SUBMISSION/Boundary_Restart/../MIREX_Model/.venv
+CONFIG=configs/salience_grouped3_hi8_score_only_xml_curated.yaml
+SLURM_ARRAY_TASK_ID=1
+HELDOUT_PIECE=M17-1
+MODEL=bilstm
+DETECTOR_TARGET=midhigh_boundary
+MIN_PRECISION=0.95
+BATCH_SIZE=128
+EPOCHS=30
+EARLY_STOP_PATIENCE=5
+SEED=42
+OUTPUT_DIR=/gpfs/work/int/yuxuanliu2204/Changheng/xmltoexp/MERIX SUBMISSION/Boundary_Restart/outputs/piece_protocol/M17-1/bilstm_midhigh_boundary_xml_curated_p95_cuda

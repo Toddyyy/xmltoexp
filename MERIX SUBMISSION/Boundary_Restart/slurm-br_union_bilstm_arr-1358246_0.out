@@ -1,0 +1,23 @@
+PROJECT_DIR=/gpfs/work/int/yuxuanliu2204/Changheng/xmltoexp/MERIX SUBMISSION/Boundary_Restart
+VENV_PATH=/gpfs/work/int/yuxuanliu2204/Changheng/xmltoexp/MERIX SUBMISSION/Boundary_Restart/../MIREX_Model/.venv
+CONFIG=configs/salience_grouped3_hi8_score_only_xml_curated.yaml
+SLURM_ARRAY_TASK_ID=0
+HELDOUT_PIECE=M06-2
+MODEL=bilstm
+DETECTOR_TARGET=midhigh_boundary
+MIN_PRECISION=0.85
+BATCH_SIZE=128
+EPOCHS=30
+EARLY_STOP_PATIENCE=5
+SEED=42
+OUTPUT_DIR=/gpfs/work/int/yuxuanliu2204/Changheng/xmltoexp/MERIX SUBMISSION/Boundary_Restart/outputs/piece_union_protocol/M06-2/bilstm_midhigh_boundary_xml_curated_p085_cuda
+Epoch 1/30 | train_loss 1.3179 | union_precision 0.7200 | weighted_recall 0.3655 | consensus_recall 0.7143 | threshold 0.500
+Epoch 2/30 | train_loss 1.3146 | union_precision 0.6786 | weighted_recall 0.3989 | consensus_recall 0.7143 | threshold 0.500
+Epoch 3/30 | train_loss 1.3117 | union_precision 1.0000 | weighted_recall 0.0501 | consensus_recall 0.0000 | threshold 0.525
+Epoch 4/30 | train_loss 1.3085 | union_precision 0.8000 | weighted_recall 0.1020 | consensus_recall 0.1429 | threshold 0.525
+Epoch 5/30 | train_loss 1.3050 | union_precision 1.0000 | weighted_recall 0.0315 | consensus_recall 0.0000 | threshold 0.550
+Epoch 6/30 | train_loss 1.3014 | union_precision 1.0000 | weighted_recall 0.0501 | consensus_recall 0.0000 | threshold 0.550
+Epoch 7/30 | train_loss 1.2972 | union_precision 1.0000 | weighted_recall 0.0315 | consensus_recall 0.0000 | threshold 0.575
+Epoch 8/30 | train_loss 1.2931 | union_precision 1.0000 | weighted_recall 0.0501 | consensus_recall 0.0000 | threshold 0.575
+Early stopping at epoch 8
+Held-out M06-2 | union_precision=1.0000 | weighted_recall=0.0501 | consensus_recall=0.0000

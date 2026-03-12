@@ -1,0 +1,21 @@
+PROJECT_DIR=/gpfs/work/int/yuxuanliu2204/Changheng/xmltoexp/MERIX SUBMISSION/Boundary_Restart
+VENV_PATH=/gpfs/work/int/yuxuanliu2204/Changheng/xmltoexp/MERIX SUBMISSION/Boundary_Restart/../MIREX_Model/.venv
+CONFIG=configs/salience_grouped3_hi8_score_only_xml_curated.yaml
+SLURM_ARRAY_TASK_ID=2
+HELDOUT_PIECE=M30-1
+MODEL=tcn
+DETECTOR_TARGET=midhigh_boundary
+MIN_PRECISION=0.95
+BATCH_SIZE=128
+EPOCHS=30
+EARLY_STOP_PATIENCE=5
+SEED=42
+OUTPUT_DIR=/gpfs/work/int/yuxuanliu2204/Changheng/xmltoexp/MERIX SUBMISSION/Boundary_Restart/outputs/piece_protocol/M30-1/tcn_midhigh_boundary_xml_curated_p95_cuda
+Epoch 1/30 | train_loss 1.1996 | precision 0.8444 | recall 0.1288 | event_f1 0.2235 | threshold 0.775
+Epoch 2/30 | train_loss 1.0142 | precision 0.7481 | recall 0.3424 | event_f1 0.4698 | threshold 0.825
+Epoch 3/30 | train_loss 0.9406 | precision 0.7222 | recall 0.2203 | event_f1 0.3377 | threshold 0.900
+Epoch 4/30 | train_loss 0.8984 | precision 0.7222 | recall 0.2203 | event_f1 0.3377 | threshold 0.875
+Epoch 5/30 | train_loss 0.8605 | precision 0.7222 | recall 0.2203 | event_f1 0.3377 | threshold 0.900
+Epoch 6/30 | train_loss 0.8392 | precision 0.7222 | recall 0.2203 | event_f1 0.3377 | threshold 0.900
+Early stopping at epoch 6
+Held-out M30-1 | precision=0.8444 | recall=0.1288 | mid/high macro_event_f1=0.2500

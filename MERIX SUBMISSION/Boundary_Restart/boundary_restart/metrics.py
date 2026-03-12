@@ -38,6 +38,23 @@ class LabeledEventMetrics:
     class_true_events: dict[int, int]
 
 
+@dataclass
+class UnionFrequencyMetrics:
+    threshold: float
+    union_precision: float
+    union_recall: float
+    union_f1: float
+    weighted_recall: float
+    consensus_recall: float
+    mean_offset: float | None
+    matches: int
+    pred_events: int
+    true_union_events: int
+    true_consensus_events: int
+    matched_weight: float
+    total_weight: float
+
+
 def extract_events(
     scores: np.ndarray,
     threshold: float,
@@ -71,7 +88,7 @@ def extract_events(
     return np.asarray(sorted(kept), dtype=np.int32)
 
 
-def greedy_match(pred_events: np.ndarray, true_events: np.ndarray, tolerance: int) -> list[int]:
+def greedy_match_pairs(pred_events: np.ndarray, true_events: np.ndarray, tolerance: int) -> list[tuple[int, int, int]]:
     pred_events = np.asarray(pred_events, dtype=np.int32)
     true_events = np.asarray(true_events, dtype=np.int32)
     candidates = []
@@ -83,14 +100,18 @@ def greedy_match(pred_events: np.ndarray, true_events: np.ndarray, tolerance: in
     candidates.sort(key=lambda item: (item[0], item[1], item[2]))
     matched_pred = set()
     matched_true = set()
-    offsets = []
+    matches = []
     for _, pred_idx, true_idx, offset in candidates:
         if pred_idx in matched_pred or true_idx in matched_true:
             continue
         matched_pred.add(pred_idx)
         matched_true.add(true_idx)
-        offsets.append(offset)
-    return offsets
+        matches.append((pred_idx, true_idx, offset))
+    return matches
+
+
+def greedy_match(pred_events: np.ndarray, true_events: np.ndarray, tolerance: int) -> list[int]:
+    return [offset for _, _, offset in greedy_match_pairs(pred_events, true_events, tolerance)]
 
 
 def evaluate_event_sequences(
@@ -315,3 +336,138 @@ def evaluate_labeled_event_sequences(
         class_pred_events=class_pred_events,
         class_true_events=class_true_events,
     )
+
+
+def evaluate_union_frequency_sequences(
+    sequence_scores: dict[str, np.ndarray],
+    sequence_union_labels: dict[str, np.ndarray],
+    sequence_frequency_targets: dict[str, np.ndarray],
+    threshold: float,
+    tolerance: int,
+    min_distance: int,
+    consensus_threshold: float = 0.5,
+    prominence: float = 0.0,
+) -> UnionFrequencyMetrics:
+    total_pred = 0
+    total_true_union = 0
+    total_true_consensus = 0
+    total_match = 0
+    total_consensus_match = 0
+    matched_weight = 0.0
+    total_weight = 0.0
+    offsets: list[int] = []
+
+    for sample_id, scores in sequence_scores.items():
+        scores = np.asarray(scores, dtype=np.float32)
+        union_labels = np.asarray(sequence_union_labels[sample_id], dtype=np.float32)
+        freq_targets = np.asarray(sequence_frequency_targets[sample_id], dtype=np.float32)
+
+        pred_events = extract_events(scores, threshold=threshold, min_distance=min_distance, prominence=prominence)
+        true_union_events = np.flatnonzero(union_labels > 0.5).astype(np.int32)
+        true_consensus_events = np.flatnonzero(freq_targets >= float(consensus_threshold)).astype(np.int32)
+
+        union_matches = greedy_match_pairs(pred_events, true_union_events, tolerance=tolerance)
+        consensus_matches = greedy_match_pairs(pred_events, true_consensus_events, tolerance=tolerance)
+
+        total_pred += int(pred_events.size)
+        total_true_union += int(true_union_events.size)
+        total_true_consensus += int(true_consensus_events.size)
+        total_match += len(union_matches)
+        total_consensus_match += len(consensus_matches)
+        offsets.extend(offset for _, _, offset in union_matches)
+        matched_weight += float(sum(freq_targets[true_union_events[true_idx]] for _, true_idx, _ in union_matches))
+        total_weight += float(freq_targets[true_union_events].sum())
+
+    union_precision = float(total_match / total_pred) if total_pred > 0 else 0.0
+    union_recall = float(total_match / total_true_union) if total_true_union > 0 else 0.0
+    denom = union_precision + union_recall
+    union_f1 = float(2.0 * union_precision * union_recall / denom) if denom > 0 else 0.0
+    weighted_recall = float(matched_weight / total_weight) if total_weight > 0 else 0.0
+    consensus_recall = float(total_consensus_match / total_true_consensus) if total_true_consensus > 0 else 0.0
+    mean_offset = float(np.mean(np.abs(offsets))) if offsets else None
+
+    return UnionFrequencyMetrics(
+        threshold=float(threshold),
+        union_precision=union_precision,
+        union_recall=union_recall,
+        union_f1=union_f1,
+        weighted_recall=weighted_recall,
+        consensus_recall=consensus_recall,
+        mean_offset=mean_offset,
+        matches=int(total_match),
+        pred_events=int(total_pred),
+        true_union_events=int(total_true_union),
+        true_consensus_events=int(total_true_consensus),
+        matched_weight=float(matched_weight),
+        total_weight=float(total_weight),
+    )
+
+
+def search_union_frequency_threshold(
+    sequence_scores: dict[str, np.ndarray],
+    sequence_union_labels: dict[str, np.ndarray],
+    sequence_frequency_targets: dict[str, np.ndarray],
+    thresholds: np.ndarray,
+    tolerance: int,
+    min_distance: int,
+    min_precision: float,
+    consensus_threshold: float = 0.5,
+    prominence: float = 0.0,
+) -> UnionFrequencyMetrics:
+    best_meeting_floor = None
+    best_fallback = None
+    for threshold in thresholds.tolist():
+        metrics = evaluate_union_frequency_sequences(
+            sequence_scores=sequence_scores,
+            sequence_union_labels=sequence_union_labels,
+            sequence_frequency_targets=sequence_frequency_targets,
+            threshold=float(threshold),
+            tolerance=tolerance,
+            min_distance=min_distance,
+            consensus_threshold=consensus_threshold,
+            prominence=prominence,
+        )
+        current_weighted_key = (
+            metrics.weighted_recall,
+            metrics.union_precision,
+            metrics.consensus_recall,
+            -float(metrics.mean_offset or 1e9),
+            -metrics.threshold,
+        )
+        current_precision_key = (
+            metrics.union_precision,
+            metrics.weighted_recall,
+            metrics.consensus_recall,
+            -float(metrics.mean_offset or 1e9),
+            -metrics.threshold,
+        )
+        if metrics.union_precision >= min_precision:
+            if best_meeting_floor is None:
+                best_meeting_floor = metrics
+            else:
+                best_key = (
+                    best_meeting_floor.weighted_recall,
+                    best_meeting_floor.union_precision,
+                    best_meeting_floor.consensus_recall,
+                    -float(best_meeting_floor.mean_offset or 1e9),
+                    -best_meeting_floor.threshold,
+                )
+                if current_weighted_key > best_key:
+                    best_meeting_floor = metrics
+        if best_fallback is None:
+            best_fallback = metrics
+        else:
+            best_key = (
+                best_fallback.union_precision,
+                best_fallback.weighted_recall,
+                best_fallback.consensus_recall,
+                -float(best_fallback.mean_offset or 1e9),
+                -best_fallback.threshold,
+            )
+            if current_precision_key > best_key:
+                best_fallback = metrics
+    if best_meeting_floor is not None:
+        return best_meeting_floor
+    if best_fallback is not None:
+        return best_fallback
+    raise ValueError("threshold search received an empty threshold grid")

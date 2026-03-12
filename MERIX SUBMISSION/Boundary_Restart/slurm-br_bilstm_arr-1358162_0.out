@@ -1,0 +1,26 @@
+PROJECT_DIR=/gpfs/work/int/yuxuanliu2204/Changheng/xmltoexp/MERIX SUBMISSION/Boundary_Restart
+VENV_PATH=/gpfs/work/int/yuxuanliu2204/Changheng/xmltoexp/MERIX SUBMISSION/Boundary_Restart/../MIREX_Model/.venv
+CONFIG=configs/salience_grouped3_hi8_score_only_xml_curated.yaml
+SLURM_ARRAY_TASK_ID=0
+HELDOUT_PIECE=M06-2
+MODEL=bilstm
+DETECTOR_TARGET=midhigh_boundary
+MIN_PRECISION=0.95
+BATCH_SIZE=128
+EPOCHS=30
+EARLY_STOP_PATIENCE=5
+SEED=42
+OUTPUT_DIR=/gpfs/work/int/yuxuanliu2204/Changheng/xmltoexp/MERIX SUBMISSION/Boundary_Restart/outputs/piece_protocol/M06-2/bilstm_midhigh_boundary_xml_curated_p95_cuda
+Epoch 1/30 | train_loss 1.2906 | precision 0.5190 | recall 0.6067 | event_f1 0.5595 | threshold 0.600
+Epoch 2/30 | train_loss 1.1750 | precision 0.5403 | recall 0.5473 | event_f1 0.5438 | threshold 0.850
+Epoch 3/30 | train_loss 1.0558 | precision 0.6463 | recall 0.3525 | event_f1 0.4562 | threshold 0.900
+Epoch 4/30 | train_loss 0.9833 | precision 0.6463 | recall 0.3525 | event_f1 0.4562 | threshold 0.925
+Epoch 5/30 | train_loss 0.9252 | precision 0.8532 | recall 0.3989 | event_f1 0.5436 | threshold 0.950
+Epoch 6/30 | train_loss 0.8846 | precision 0.8810 | recall 0.3432 | event_f1 0.4940 | threshold 0.950
+Epoch 7/30 | train_loss 0.8540 | precision 0.8190 | recall 0.3191 | event_f1 0.4593 | threshold 0.950
+Epoch 8/30 | train_loss 0.8312 | precision 0.8190 | recall 0.3191 | event_f1 0.4593 | threshold 0.950
+Epoch 9/30 | train_loss 0.8108 | precision 0.8056 | recall 0.3766 | event_f1 0.5133 | threshold 0.950
+Epoch 10/30 | train_loss 0.7947 | precision 0.8244 | recall 0.5139 | event_f1 0.6331 | threshold 0.925
+Epoch 11/30 | train_loss 0.7818 | precision 0.8056 | recall 0.3766 | event_f1 0.5133 | threshold 0.950
+Early stopping at epoch 11
+Held-out M06-2 | precision=0.8810 | recall=0.3432 | mid/high macro_event_f1=0.2406

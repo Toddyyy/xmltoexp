@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 import torch
 from torch import nn
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
@@ -104,6 +106,63 @@ class TCNTagger(nn.Module):
         return x.squeeze(1) if x.size(1) == 1 else x.transpose(1, 2)
 
 
+class SinusoidalPositionalEncoding(nn.Module):
+    def __init__(self, dim: int, max_len: int = 4096):
+        super().__init__()
+        position = torch.arange(max_len, dtype=torch.float32).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, dim, 2, dtype=torch.float32) * (-math.log(10000.0) / dim))
+        pe = torch.zeros(max_len, dim, dtype=torch.float32)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer("pe", pe.unsqueeze(0), persistent=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.pe[:, : x.size(1), :]
+
+
+class TransformerTagger(nn.Module):
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int = 64,
+        num_layers: int = 2,
+        num_heads: int = 4,
+        ff_dim: int = 256,
+        dropout: float = 0.2,
+        output_dim: int = 1,
+    ):
+        super().__init__()
+        if hidden_dim % num_heads != 0:
+            raise ValueError(f"hidden_dim ({hidden_dim}) must be divisible by num_heads ({num_heads})")
+        self.input_proj = nn.Linear(input_dim, hidden_dim)
+        self.positional_encoding = SinusoidalPositionalEncoding(hidden_dim)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim,
+            nhead=num_heads,
+            dim_feedforward=ff_dim,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.dropout = nn.Dropout(dropout)
+        self.head = nn.Linear(hidden_dim, output_dim)
+
+    def forward(self, x: torch.Tensor, lengths: torch.Tensor | None = None) -> torch.Tensor:
+        x = self.input_proj(x)
+        x = self.positional_encoding(x)
+        padding_mask = None
+        if lengths is not None:
+            max_len = x.size(1)
+            positions = torch.arange(max_len, device=x.device).unsqueeze(0)
+            padding_mask = positions >= lengths.unsqueeze(1)
+        x = self.encoder(x, src_key_padding_mask=padding_mask)
+        x = self.dropout(x)
+        logits = self.head(x)
+        return logits.squeeze(-1) if logits.size(-1) == 1 else logits
+
+
 def build_sequence_model(model_type: str, input_dim: int, cfg: dict, output_dim: int = 1) -> nn.Module:
     seq_cfg = cfg.get("sequence", {})
     model_type = model_type.lower()
@@ -121,6 +180,20 @@ def build_sequence_model(model_type: str, input_dim: int, cfg: dict, output_dim:
             input_dim=input_dim,
             channels=channels,
             kernel_size=int(seq_cfg.get("kernel_size", 3)),
+            dropout=float(seq_cfg.get("dropout", 0.2)),
+            output_dim=output_dim,
+        )
+    if model_type == "transformer":
+        hidden_dim = int(seq_cfg.get("transformer_dim", seq_cfg.get("hidden_dim", 64)))
+        num_layers = int(seq_cfg.get("transformer_layers", seq_cfg.get("num_layers", 2)))
+        num_heads = int(seq_cfg.get("transformer_heads", 4))
+        ff_dim = int(seq_cfg.get("transformer_ff_dim", hidden_dim * 4))
+        return TransformerTagger(
+            input_dim=input_dim,
+            hidden_dim=hidden_dim,
+            num_layers=num_layers,
+            num_heads=num_heads,
+            ff_dim=ff_dim,
             dropout=float(seq_cfg.get("dropout", 0.2)),
             output_dim=output_dim,
         )

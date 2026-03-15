@@ -11,3 +11,13 @@ MERIX SUBMISSION/MIREX_Model/check
 
 # Boundary_Restart generated artifacts
 MERIX SUBMISSION/Boundary_Restart/outputs/
+
+# Boundary_Restart nested CV reports: keep only small summaries
+MERIX SUBMISSION/Boundary_Restart/reports/nested_piece_cv/**
+!MERIX SUBMISSION/Boundary_Restart/reports/nested_piece_cv/
+!MERIX SUBMISSION/Boundary_Restart/reports/nested_piece_cv/**/
+!MERIX SUBMISSION/Boundary_Restart/reports/nested_piece_cv/**/summary.json
+!MERIX SUBMISSION/Boundary_Restart/reports/nested_piece_cv/**/candidate_summary.csv
+!MERIX SUBMISSION/Boundary_Restart/reports/nested_piece_cv/**/inner_fold_results.csv
+!MERIX SUBMISSION/Boundary_Restart/reports/nested_piece_cv/**/inner_folds.json
+!MERIX SUBMISSION/Boundary_Restart/reports/nested_piece_cv/**/candidates.json

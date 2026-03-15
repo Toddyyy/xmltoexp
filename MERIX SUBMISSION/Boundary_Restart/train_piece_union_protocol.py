@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import re
 from pathlib import Path
 
 import numpy as np
@@ -17,9 +18,28 @@ from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
 from boundary_restart.config import load_config, resolve_path, threshold_grid
-from boundary_restart.metrics import evaluate_labeled_event_sequences, search_union_frequency_threshold
+from boundary_restart.derived_features import add_highlevel_derived_features
+from boundary_restart.features import PeakConfig, boundary_probs_to_binary, load_boundary_npz, replace_level_suffix
+from boundary_restart.metrics import (
+    evaluate_labeled_event_sequences,
+    extract_events,
+    greedy_match_pairs,
+    search_union_frequency_threshold,
+)
+from boundary_restart.rest_spans import (
+    build_rest_span_arrays,
+    build_rest_span_tolerance_weights,
+    canonicalize_frequency_with_ignore,
+    expand_frequency_over_rest_spans,
+)
 from boundary_restart.models import build_sequence_model
 from boundary_restart.table_io import feature_columns, load_table
+
+RAW_LEVEL_TARGET_RE = re.compile(r"^level([1-6])_boundary$")
+RAW_LEVEL_GROUP_TARGETS = {
+    "level34_boundary": (3, 4),
+    "level56_boundary": (5, 6),
+}
 
 
 def set_seed(seed: int):
@@ -82,7 +102,27 @@ def detector_labels(stage_class: np.ndarray, mode: str) -> np.ndarray:
         return (stage_class == 2).astype(np.float32)
     if mode == "high_boundary":
         return (stage_class >= 3).astype(np.float32)
+    raw_level = parse_raw_level_target(mode)
+    if raw_level is not None:
+        raise ValueError(
+            f"detector_labels received raw level target {mode} without per-level target augmentation"
+        )
     raise ValueError(f"Unsupported detector target mode: {mode}")
+
+
+def parse_raw_level_target(mode: str) -> int | None:
+    match = RAW_LEVEL_TARGET_RE.match(str(mode))
+    return int(match.group(1)) if match else None
+
+
+def parse_raw_level_targets(mode: str) -> tuple[int, ...] | None:
+    single = parse_raw_level_target(mode)
+    if single is not None:
+        return (single,)
+    grouped = RAW_LEVEL_GROUP_TARGETS.get(str(mode))
+    if grouped is not None:
+        return tuple(int(x) for x in grouped)
+    return None
 
 
 def apply_piece_protocol_split(
@@ -135,9 +175,40 @@ def build_loss_weights(
     return weights.astype(np.float32)
 
 
-def build_piece_union_frame(df: pd.DataFrame, feature_cols: list[str], target_mode: str) -> pd.DataFrame:
+def build_piece_union_frame(
+    df: pd.DataFrame,
+    feature_cols: list[str],
+    target_mode: str,
+    peak_cfg: PeakConfig,
+    beat_unit_fallback: float,
+) -> pd.DataFrame:
     frame = df.copy()
-    frame["detector_binary"] = detector_labels(frame["stage_class"].to_numpy(dtype=np.int64), mode=target_mode)
+    raw_levels = parse_raw_level_targets(target_mode)
+    if raw_levels is not None:
+        if "source_path" not in frame.columns:
+            raise ValueError("raw level targets require source_path in the beat table")
+        detector_binary = np.zeros(len(frame), dtype=np.float32)
+        beat_idx = frame["beat_idx"].to_numpy(dtype=np.int32)
+        for source_path, positions in frame.groupby("source_path", sort=False).indices.items():
+            pos = np.asarray(positions, dtype=np.int64)
+            boundary_binary = None
+            for raw_level in raw_levels:
+                level_path = replace_level_suffix(Path(str(source_path)), level=raw_level)
+                loaded = load_boundary_npz(level_path, beat_unit_fallback=beat_unit_fallback)
+                current_binary = boundary_probs_to_binary(
+                    np.asarray(loaded["boundary_probs"], dtype=np.float32),
+                    peak_cfg,
+                ).astype(np.float32)
+                boundary_binary = current_binary if boundary_binary is None else np.maximum(boundary_binary, current_binary)
+            sample_beat_idx = beat_idx[pos]
+            if sample_beat_idx.size and sample_beat_idx.max() >= boundary_binary.shape[0]:
+                raise ValueError(
+                    f"beat_idx out of range for {source_path} {raw_levels}: max beat {sample_beat_idx.max()} >= {boundary_binary.shape[0]}"
+                )
+            detector_binary[pos] = boundary_binary[sample_beat_idx].astype(np.float32)
+        frame["detector_binary"] = detector_binary.astype(np.float32)
+    else:
+        frame["detector_binary"] = detector_labels(frame["stage_class"].to_numpy(dtype=np.int64), mode=target_mode)
     frame["low_binary"] = (frame["stage_class"].to_numpy(dtype=np.int64) == 1).astype(np.float32)
     frame["mid_binary"] = (frame["stage_class"].to_numpy(dtype=np.int64) == 2).astype(np.float32)
     frame["high_binary"] = (frame["stage_class"].to_numpy(dtype=np.int64) >= 3).astype(np.float32)
@@ -176,6 +247,63 @@ def build_piece_union_frame(df: pd.DataFrame, feature_cols: list[str], target_mo
     return piece
 
 
+def apply_rest_span_training_labels(
+    piece_df: pd.DataFrame,
+    mode: str,
+    min_len: int,
+    source_col: str,
+    source_threshold: float,
+    tolerance_negative_weight: float,
+) -> pd.DataFrame:
+    frame = piece_df.copy()
+    frame["train_frequency_target"] = frame["frequency_target"].astype(np.float32)
+    frame["train_union_target"] = frame["union_target"].astype(np.float32)
+    frame["train_loss_factor"] = np.ones(len(frame), dtype=np.float32)
+    if mode == "none" and float(tolerance_negative_weight) >= 1.0:
+        return frame
+
+    if source_col not in frame.columns:
+        raise ValueError(f"rest-span training labels require {source_col} in the piece-level frame")
+
+    updated_groups = []
+    for piece_id, group in frame.sort_values(["piece_id", "beat_idx"]).groupby("piece_id", sort=False):
+        group = group.copy().reset_index(drop=True)
+        empty_mask = group[source_col].to_numpy(dtype=np.float32) > float(source_threshold)
+        span_id, _, _ = build_rest_span_arrays(empty_mask, min_len=int(min_len))
+        train_freq = group["frequency_target"].to_numpy(dtype=np.float32).copy()
+        train_union = group["union_target"].to_numpy(dtype=np.float32).copy()
+        train_loss_factor = np.ones_like(train_freq, dtype=np.float32)
+        if mode == "expand_max":
+            train_freq = expand_frequency_over_rest_spans(
+                train_freq,
+                span_id=span_id,
+                agg="max",
+            )
+            train_union = (train_freq > 0.0).astype(np.float32)
+        elif mode == "canonical_ignore":
+            train_freq, train_union, ignore_loss = canonicalize_frequency_with_ignore(
+                train_freq,
+                span_id=span_id,
+                agg="max",
+            )
+            train_loss_factor *= ignore_loss
+        elif mode == "none":
+            pass
+        else:
+            raise ValueError(f"Unsupported rest_span_label_mode: {mode}")
+        if float(tolerance_negative_weight) < 1.0:
+            train_loss_factor *= build_rest_span_tolerance_weights(
+                group["frequency_target"].to_numpy(dtype=np.float32),
+                span_id=span_id,
+                negative_weight=float(tolerance_negative_weight),
+            )
+        group["train_frequency_target"] = train_freq.astype(np.float32)
+        group["train_union_target"] = train_union.astype(np.float32)
+        group["train_loss_factor"] = train_loss_factor.astype(np.float32)
+        updated_groups.append(group)
+    return pd.concat(updated_groups, axis=0, ignore_index=True)
+
+
 class PieceUnionDataset(Dataset):
     def __init__(
         self,
@@ -204,17 +332,18 @@ class PieceUnionDataset(Dataset):
             "piece_id": sample["piece_id"],
             "beat_idx": sample["beat_idx"].astype(np.int32),
             "features": features.astype(np.float32),
-            "labels": sample["frequency_target"].astype(np.float32),
+            "labels": sample["train_frequency_target"].astype(np.float32),
             "union_labels": sample["union_target"].astype(np.float32),
             "frequency_target": sample["frequency_target"].astype(np.float32),
             "performer_count": sample["performer_count"].astype(np.int32),
             "loss_weights": build_loss_weights(
-                sample["union_target"],
+                sample["train_union_target"],
                 hard_negative_radius=self.hard_negative_radius,
                 hard_negative_weight=self.hard_negative_weight,
                 easy_negative_weight=self.easy_negative_weight,
-            ),
-            "length": int(sample["frequency_target"].shape[0]),
+            )
+            * sample["train_loss_factor"].astype(np.float32),
+            "length": int(sample["train_frequency_target"].shape[0]),
         }
 
 
@@ -285,13 +414,57 @@ def piece_samples_from_frame(
                 "features": group[feature_cols].to_numpy(dtype=np.float32),
                 "union_target": group["union_target"].to_numpy(dtype=np.float32),
                 "frequency_target": group["frequency_target"].to_numpy(dtype=np.float32),
+                "train_union_target": group["train_union_target"].to_numpy(dtype=np.float32)
+                if "train_union_target" in group.columns
+                else group["union_target"].to_numpy(dtype=np.float32),
+                "train_frequency_target": group["train_frequency_target"].to_numpy(dtype=np.float32)
+                if "train_frequency_target" in group.columns
+                else group["frequency_target"].to_numpy(dtype=np.float32),
                 "performer_count": group["performer_count"].to_numpy(dtype=np.int32),
+                "train_loss_factor": group["train_loss_factor"].to_numpy(dtype=np.float32)
+                if "train_loss_factor" in group.columns
+                else np.ones(len(group), dtype=np.float32),
             }
         )
     return samples
 
 
-def train_one_epoch(model, loader, optimizer, device, loss_fn, grad_clip: float, log_interval: int = 0) -> float:
+def compute_detector_loss(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    mask: torch.Tensor,
+    loss_weights: torch.Tensor,
+    loss_type: str,
+    loss_fn: nn.Module,
+) -> torch.Tensor:
+    if loss_type in {"bce", "bce_freq_weighted"}:
+        per_token = loss_fn(logits, labels)
+    elif loss_type in {"huber", "mse"}:
+        preds = torch.sigmoid(logits)
+        per_token = loss_fn(preds, labels)
+    else:
+        raise ValueError(f"Unsupported loss_type: {loss_type}")
+    token_weights = mask.float() * loss_weights
+    if loss_type == "bce_freq_weighted":
+        positive_mask = labels > 0.0
+        if torch.any(positive_mask):
+            pos_mean = labels[positive_mask].mean().clamp(min=1e-3)
+            freq_factor = torch.ones_like(labels)
+            freq_factor[positive_mask] = (labels[positive_mask] / pos_mean).clamp(min=0.25, max=4.0)
+            token_weights = token_weights * freq_factor
+    return (per_token * token_weights).sum() / token_weights.sum().clamp(min=1.0)
+
+
+def train_one_epoch(
+    model,
+    loader,
+    optimizer,
+    device,
+    loss_fn,
+    loss_type: str,
+    grad_clip: float,
+    log_interval: int = 0,
+) -> float:
     model.train()
     total_loss = 0.0
     total_tokens = 0
@@ -304,9 +477,14 @@ def train_one_epoch(model, loader, optimizer, device, loss_fn, grad_clip: float,
 
         optimizer.zero_grad()
         logits = model(features, lengths=lengths)
-        loss = loss_fn(logits, labels)
-        token_weights = mask.float() * loss_weights
-        loss = (loss * token_weights).sum() / token_weights.sum().clamp(min=1.0)
+        loss = compute_detector_loss(
+            logits=logits,
+            labels=labels,
+            mask=mask,
+            loss_weights=loss_weights,
+            loss_type=loss_type,
+            loss_fn=loss_fn,
+        )
         loss.backward()
         if grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
@@ -453,12 +631,63 @@ def union_metrics_to_dict(metrics) -> dict:
     }
 
 
+def build_predicted_event_frame(
+    pred_df: pd.DataFrame,
+    threshold: float,
+    min_distance: int,
+    prominence: float,
+    tolerance: int,
+) -> pd.DataFrame:
+    rows = []
+    ordered = pred_df.sort_values(["sample_id", "beat_idx"]).copy()
+    prob_cols = [col for col in ordered.columns if col.startswith("pred_stage_prob_")]
+
+    for sample_id, group in ordered.groupby("sample_id", sort=False):
+        group = group.reset_index(drop=True)
+        scores = group["detector_score"].to_numpy(dtype=np.float32)
+        pred_events = extract_events(
+            scores,
+            threshold=float(threshold),
+            min_distance=int(min_distance),
+            prominence=float(prominence),
+        )
+        true_union_events = np.flatnonzero(group["union_target"].to_numpy(dtype=np.float32) > 0.5).astype(np.int32)
+        match_pairs = greedy_match_pairs(pred_events, true_union_events, tolerance=int(tolerance))
+        match_map = {pred_idx: (true_idx, offset) for pred_idx, true_idx, offset in match_pairs}
+
+        for event_rank, pred_idx in enumerate(pred_events.tolist(), start=1):
+            row = group.iloc[int(pred_idx)]
+            true_match = match_map.get(int(event_rank - 1))
+            event_row = {
+                "sample_id": str(sample_id),
+                "piece_id": str(row["piece_id"]),
+                "event_rank": int(event_rank),
+                "beat_idx": int(row["beat_idx"]),
+                "detector_score": float(row["detector_score"]),
+                "threshold": float(threshold),
+                "union_target_at_beat": float(row["union_target"]),
+                "frequency_target_at_beat": float(row["frequency_target"]),
+                "performer_count": int(row["performer_count"]),
+                "matched_union": bool(true_match is not None),
+                "match_offset": int(true_match[1]) if true_match is not None else None,
+                "matched_true_beat_idx": int(true_union_events[true_match[0]]) if true_match is not None else None,
+            }
+            if "dominant_stage" in group.columns:
+                event_row["dominant_stage_at_beat"] = int(row["dominant_stage"])
+            if "pred_stage_class" in group.columns:
+                event_row["pred_stage_class"] = int(row["pred_stage_class"])
+            for col in prob_cols:
+                event_row[col] = float(row[col])
+            rows.append(event_row)
+    return pd.DataFrame(rows)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Piece-level union/frequency detector protocol.")
     parser.add_argument("--config", required=True)
     parser.add_argument("--heldout_piece", nargs="+", required=True)
     parser.add_argument("--train_pieces", nargs="*", default=None)
-    parser.add_argument("--model", choices=["bilstm", "tcn"], default="tcn")
+    parser.add_argument("--model", choices=["bilstm", "tcn", "transformer"], default="tcn")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--batch_size", type=int, default=None)
@@ -468,7 +697,21 @@ def main():
     parser.add_argument("--output_dir", default=None)
     parser.add_argument(
         "--detector_target",
-        choices=["any_boundary", "midhigh_boundary", "low_boundary", "mid_boundary", "high_boundary"],
+        choices=[
+            "any_boundary",
+            "midhigh_boundary",
+            "low_boundary",
+            "mid_boundary",
+            "high_boundary",
+            "level1_boundary",
+            "level2_boundary",
+            "level3_boundary",
+            "level4_boundary",
+            "level5_boundary",
+            "level6_boundary",
+            "level34_boundary",
+            "level56_boundary",
+        ],
         default="midhigh_boundary",
     )
     parser.add_argument("--min_precision", type=float, default=0.85)
@@ -480,11 +723,31 @@ def main():
         choices=["weighted_recall", "union_recall", "consensus_recall"],
         default="weighted_recall",
     )
+    parser.add_argument("--loss_type", choices=["bce", "bce_freq_weighted", "huber", "mse"], default="bce")
+    parser.add_argument("--rest_span_label_mode", choices=["none", "expand_max", "canonical_ignore"], default="none")
+    parser.add_argument("--rest_span_min_len", type=int, default=2)
+    parser.add_argument("--rest_span_source_col", default="xml_rest_duration_norm")
+    parser.add_argument("--rest_span_source_threshold", type=float, default=1e-8)
+    parser.add_argument("--rest_span_tolerance_negative_weight", type=float, default=1.0)
     parser.add_argument("--skip_stage_grading", action="store_true")
+    parser.add_argument("--add_derived_highlevel_features", action="store_true")
+    parser.add_argument("--derived_feature_include", nargs="*", default=None)
+    parser.add_argument("--transformer_dim", type=int, default=None)
+    parser.add_argument("--transformer_heads", type=int, default=None)
+    parser.add_argument("--transformer_layers", type=int, default=None)
+    parser.add_argument("--transformer_ff_dim", type=int, default=None)
     args = parser.parse_args()
 
     cfg = load_config(args.config)
     seq_cfg = cfg.get("sequence", {})
+    if args.transformer_dim is not None:
+        seq_cfg["transformer_dim"] = int(args.transformer_dim)
+    if args.transformer_heads is not None:
+        seq_cfg["transformer_heads"] = int(args.transformer_heads)
+    if args.transformer_layers is not None:
+        seq_cfg["transformer_layers"] = int(args.transformer_layers)
+    if args.transformer_ff_dim is not None:
+        seq_cfg["transformer_ff_dim"] = int(args.transformer_ff_dim)
     eval_cfg = cfg.get("evaluation", {})
     data_cfg = cfg.get("data", {})
 
@@ -508,12 +771,39 @@ def main():
     out_root.mkdir(parents=True, exist_ok=True)
 
     df = load_table(table_path)
+    original_columns = set(df.columns)
+    if args.add_derived_highlevel_features:
+        df = add_highlevel_derived_features(df)
     df = apply_piece_protocol_split(df, heldout_pieces=args.heldout_piece, train_pieces=args.train_pieces)
     df = df[df["protocol_split"].isin(["train", "val"])].copy()
     all_feature_cols = feature_columns(df)
     feature_cols = select_feature_columns(cfg, all_feature_cols)
+    if args.add_derived_highlevel_features and args.derived_feature_include:
+        allowed = set(args.derived_feature_include)
+        derived_cols = [col for col in feature_cols if col not in original_columns]
+        feature_cols = [col for col in feature_cols if col not in derived_cols or col in allowed]
     grader_feature_cols = select_grader_feature_columns(cfg, feature_cols, all_feature_cols)
-    piece_df = build_piece_union_frame(df, feature_cols=feature_cols, target_mode=args.detector_target)
+    peak_cfg = PeakConfig(
+        distance=int(data_cfg.get("peak_distance", 6)),
+        height=float(data_cfg.get("peak_height", 0.15)),
+        prominence=float(data_cfg.get("peak_prominence", 0.05)),
+    )
+    beat_unit_fallback = float(data_cfg.get("beat_unit_fallback", 1.0))
+    piece_df = build_piece_union_frame(
+        df,
+        feature_cols=feature_cols,
+        target_mode=args.detector_target,
+        peak_cfg=peak_cfg,
+        beat_unit_fallback=beat_unit_fallback,
+    )
+    piece_df = apply_rest_span_training_labels(
+        piece_df,
+        mode=str(args.rest_span_label_mode),
+        min_len=int(args.rest_span_min_len),
+        source_col=str(args.rest_span_source_col),
+        source_threshold=float(args.rest_span_source_threshold),
+        tolerance_negative_weight=float(args.rest_span_tolerance_negative_weight),
+    )
 
     train_samples = piece_samples_from_frame(piece_df, feature_cols, split="train")
     val_samples = piece_samples_from_frame(piece_df, feature_cols, split="val")
@@ -541,11 +831,18 @@ def main():
         weight_decay=float(seq_cfg.get("weight_decay", 1e-4)),
     )
 
-    train_labels = np.concatenate([sample["frequency_target"] for sample in train_samples], axis=0)
-    pos = float(train_labels.sum())
-    neg = float(train_labels.shape[0] - pos)
-    pos_weight = torch.tensor([neg / max(pos, 1.0)], device=device, dtype=torch.float32)
-    loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight, reduction="none")
+    train_labels = np.concatenate([sample["train_frequency_target"] for sample in train_samples], axis=0)
+    if args.loss_type in {"bce", "bce_freq_weighted"}:
+        pos = float(train_labels.sum())
+        neg = float(train_labels.shape[0] - pos)
+        pos_weight = torch.tensor([neg / max(pos, 1.0)], device=device, dtype=torch.float32)
+        loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight, reduction="none")
+    elif args.loss_type == "huber":
+        loss_fn = nn.SmoothL1Loss(reduction="none")
+    elif args.loss_type == "mse":
+        loss_fn = nn.MSELoss(reduction="none")
+    else:
+        raise ValueError(f"Unsupported loss_type: {args.loss_type}")
 
     thresholds = threshold_grid(cfg)
     tolerance = int(eval_cfg.get("event_tolerance", 1))
@@ -570,6 +867,7 @@ def main():
             optimizer=optimizer,
             device=device,
             loss_fn=loss_fn,
+            loss_type=args.loss_type,
             grad_clip=grad_clip,
             log_interval=max(int(args.log_interval), 0),
         )
@@ -640,6 +938,7 @@ def main():
                     "best_threshold": metrics.threshold,
                     "min_precision": args.min_precision,
                     "consensus_threshold": consensus_threshold,
+                    "loss_type": args.loss_type,
                 },
                 out_root / "detector_best.pt",
             )
@@ -706,6 +1005,12 @@ def main():
         "val_sequence_count": int(val_df["piece_sample_id"].nunique()),
         "model_type": args.model,
         "detector_target": args.detector_target,
+        "model_hparams": {
+            "transformer_dim": seq_cfg.get("transformer_dim"),
+            "transformer_heads": seq_cfg.get("transformer_heads"),
+            "transformer_layers": seq_cfg.get("transformer_layers"),
+            "transformer_ff_dim": seq_cfg.get("transformer_ff_dim"),
+        },
         "seed": seed,
         "device": str(device),
         "best_epoch": best_epoch,
@@ -717,6 +1022,12 @@ def main():
         "hard_negative_weight": float(args.hard_negative_weight),
         "easy_negative_weight": float(args.easy_negative_weight),
         "selection_metric": str(args.selection_metric),
+        "loss_type": str(args.loss_type),
+        "rest_span_label_mode": str(args.rest_span_label_mode),
+        "rest_span_min_len": int(args.rest_span_min_len),
+        "rest_span_source_col": str(args.rest_span_source_col),
+        "rest_span_source_threshold": float(args.rest_span_source_threshold),
+        "rest_span_tolerance_negative_weight": float(args.rest_span_tolerance_negative_weight),
         "skip_stage_grading": bool(args.skip_stage_grading),
         "precision_floor_met": bool(best_metrics.union_precision >= float(args.min_precision)),
         "union_metrics": union_metrics_to_dict(best_metrics),
@@ -732,6 +1043,14 @@ def main():
     if class_event_metrics is not None:
         summary["end_to_end_stage"] = labeled_metrics_to_dict(class_event_metrics)
     (out_root / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    predicted_events = build_predicted_event_frame(
+        pred_df=merged_val,
+        threshold=float(best_metrics.threshold),
+        min_distance=min_distance,
+        prominence=prominence,
+        tolerance=tolerance,
+    )
+    predicted_events.to_csv(out_root / "predicted_events.csv.gz", index=False, compression="gzip")
     print(
         f"Held-out {heldout_slug} | union_precision={best_metrics.union_precision:.4f} | "
         f"weighted_recall={best_metrics.weighted_recall:.4f} | consensus_recall={best_metrics.consensus_recall:.4f}"

@@ -208,7 +208,7 @@ def main() -> None:
         sequence_scores=sequence_scores,
         sequence_union_labels=sequence_union,
         sequence_frequency_targets=sequence_frequency,
-        thresholds=[fixed_threshold],
+        thresholds=np.asarray([fixed_threshold], dtype=np.float32),
         tolerance=tolerance,
         min_distance=min_distance,
         min_precision=float(candidate.get("min_precision", 0.0)),

@@ -1,0 +1,66 @@
+PROJECT_DIR=/gpfs/work/int/yuxuanliu2204/Changheng/xmltoexp/MERIX SUBMISSION/Boundary_Restart
+SEED=42
+CONFIG=configs/salience_grouped3_hi8_score_only_xml_curated.yaml
+OUTER_PIECES=M06-1 M06-2 M06-3
+DEVICE=cuda
+
+=== SEED=42 LEVEL=level1 ===
+NESTED_DIR=reports/nested_piece_cv/M06_outer_level1_seed42
+OUTPUT_DIR=reports/clean_outer_test/M06_outer_level1_seed42
+Epoch 1/6 | train_loss 1.3832
+Epoch 2/6 | train_loss 1.3126
+Epoch 3/6 | train_loss 1.2593
+Epoch 4/6 | train_loss 1.2394
+Epoch 5/6 | train_loss 1.2227
+Epoch 6/6 | train_loss 1.2082
+Clean outer M06-1__M06-2__M06-3 | union_precision=0.9758 | union_recall=0.1822 | weighted_recall=0.2770 | consensus_recall=0.6977 | threshold=0.067 | epochs=6
+
+=== SEED=42 LEVEL=level2 ===
+NESTED_DIR=reports/nested_piece_cv/M06_outer_level2_seed42
+OUTPUT_DIR=reports/clean_outer_test/M06_outer_level2_seed42
+Epoch 1/5 | train_loss 1.4386
+Epoch 2/5 | train_loss 1.3322
+Epoch 3/5 | train_loss 1.2704
+Epoch 4/5 | train_loss 1.2395
+Epoch 5/5 | train_loss 1.2174
+Clean outer M06-1__M06-2__M06-3 | union_precision=0.9000 | union_recall=0.2236 | weighted_recall=0.3668 | consensus_recall=0.7925 | threshold=0.158 | epochs=5
+
+=== SEED=42 LEVEL=level3 ===
+NESTED_DIR=reports/nested_piece_cv/M06_outer_level3_seed42
+OUTPUT_DIR=reports/clean_outer_test/M06_outer_level3_seed42
+Epoch 1/9 | train_loss 1.4988
+Epoch 2/9 | train_loss 1.3747
+Epoch 3/9 | train_loss 1.3032
+Epoch 4/9 | train_loss 1.2576
+Epoch 5/9 | train_loss 1.2327
+Epoch 6/9 | train_loss 1.2096
+Epoch 7/9 | train_loss 1.1890
+Epoch 8/9 | train_loss 1.1647
+Epoch 9/9 | train_loss 1.1534
+Clean outer M06-1__M06-2__M06-3 | union_precision=0.6869 | union_recall=0.2329 | weighted_recall=0.3487 | consensus_recall=0.6400 | threshold=0.535 | epochs=9
+
+=== SEED=42 LEVEL=level4 ===
+NESTED_DIR=reports/nested_piece_cv/M06_outer_level4_seed42
+OUTPUT_DIR=reports/clean_outer_test/M06_outer_level4_seed42
+Epoch 1/9 | train_loss 1.5273
+Epoch 2/9 | train_loss 1.4017
+Epoch 3/9 | train_loss 1.3271
+Epoch 4/9 | train_loss 1.2815
+Epoch 5/9 | train_loss 1.2525
+Epoch 6/9 | train_loss 1.2280
+Epoch 7/9 | train_loss 1.2059
+Epoch 8/9 | train_loss 1.1762
+Epoch 9/9 | train_loss 1.1620
+Clean outer M06-1__M06-2__M06-3 | union_precision=0.7027 | union_recall=0.1340 | weighted_recall=0.1686 | consensus_recall=0.2857 | threshold=0.617 | epochs=9
+
+=== SEED=42 LEVEL=level56 ===
+NESTED_DIR=reports/nested_piece_cv/M06_outer_level56_seed42
+OUTPUT_DIR=reports/clean_outer_test/M06_outer_level56_seed42
+Epoch 1/7 | train_loss 1.5388
+Epoch 2/7 | train_loss 1.4053
+Epoch 3/7 | train_loss 1.3191
+Epoch 4/7 | train_loss 1.2806
+Epoch 5/7 | train_loss 1.2477
+Epoch 6/7 | train_loss 1.2133
+Epoch 7/7 | train_loss 1.1907
+Clean outer M06-1__M06-2__M06-3 | union_precision=0.6875 | union_recall=0.0982 | weighted_recall=0.2069 | consensus_recall=0.4000 | threshold=0.615 | epochs=7

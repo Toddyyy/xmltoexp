@@ -82,10 +82,16 @@ def build_base_candidate(args: argparse.Namespace) -> dict:
         "model": str(args.model),
         "detector_target": str(args.detector_target),
         "selection_metric": str(args.selection_metric),
+        "precision_metric": str(args.precision_metric),
         "min_precision": float(args.min_precision),
         "loss_type": str(args.loss_type),
         "rest_span_label_mode": str(args.rest_span_label_mode),
         "rest_span_tolerance_negative_weight": float(args.rest_span_tolerance_negative_weight),
+        "min_train_frequency_target": float(args.min_train_frequency_target),
+        "cumulative_merge_tolerance": int(args.cumulative_merge_tolerance),
+        "cumulative_component_weights_json": str(args.cumulative_component_weights_json)
+        if args.cumulative_component_weights_json is not None
+        else None,
         "device": str(args.device),
         "batch_size": int(args.batch_size) if args.batch_size is not None else None,
         "epochs": int(args.epochs) if args.epochs is not None else None,
@@ -154,10 +160,14 @@ def run_protocol(
         "model",
         "detector_target",
         "selection_metric",
+        "precision_metric",
         "min_precision",
         "loss_type",
         "rest_span_label_mode",
         "rest_span_tolerance_negative_weight",
+        "min_train_frequency_target",
+        "cumulative_merge_tolerance",
+        "cumulative_component_weights_json",
         "device",
         "batch_size",
         "epochs",
@@ -224,10 +234,14 @@ def main() -> None:
     parser.add_argument("--model", default="tcn")
     parser.add_argument("--detector_target", default="level56_boundary")
     parser.add_argument("--selection_metric", default="union_recall")
+    parser.add_argument("--precision_metric", default="union_precision")
     parser.add_argument("--min_precision", type=float, default=0.85)
     parser.add_argument("--loss_type", default="bce")
     parser.add_argument("--rest_span_label_mode", default="none")
     parser.add_argument("--rest_span_tolerance_negative_weight", type=float, default=1.0)
+    parser.add_argument("--min_train_frequency_target", type=float, default=0.0)
+    parser.add_argument("--cumulative_merge_tolerance", type=int, default=0)
+    parser.add_argument("--cumulative_component_weights_json", default=None)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--epochs", type=int, default=None)

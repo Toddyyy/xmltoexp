@@ -34,30 +34,36 @@ def _find_project_root(start: Path) -> Path:
 
 
 PROJECT_ROOT = _find_project_root(Path(__file__).resolve().parent)
-SUPPORTED_PIECES = ["M06-2", "M17-1", "M30-1"]
-GROUP_SPECS = {
-    "L1": {
-        "detector_target": "level1_boundary",
-        "color": "#0a6cff",
-        "run_name": "tcn_level1_boundary_union_recall_cpu",
-    },
-    "L2": {
-        "detector_target": "level2_boundary",
-        "color": "#00a35c",
-        "run_name": "tcn_level2_boundary_union_recall_cpu",
-    },
-    "L3+4": {
-        "detector_target": "level34_boundary",
-        "color": "#ff8a00",
-        "run_name": "tcn_level34_boundary_union_recall_cpu",
-    },
-    "L5+6": {
-        "detector_target": "level56_boundary",
-        "color": "#c2185b",
-        "run_name": "tcn_level56_boundary_union_recall_cpu",
-    },
+SUPPORTED_PIECES = ["M06-1", "M06-2", "M06-3", "M17-1", "M30-1"]
+SEED_ORDER = [42, 44]
+STRATEGY_ORDER = ["baseline", "consensus_guarded"]
+STRATEGY_LABELS = {
+    "baseline": "Baseline",
+    "consensus_guarded": "Consensus Guarded",
 }
-GROUP_ORDER = list(GROUP_SPECS.keys())
+CLEAN_GROUP_SPECS = {
+    "L1": {"slug": "level1", "color": "#0a6cff"},
+    "L2": {"slug": "level2", "color": "#00a35c"},
+    "L3": {"slug": "level3", "color": "#ff8a00"},
+    "L4": {"slug": "level4", "color": "#7b1fa2"},
+    "L5+6": {"slug": "level56", "color": "#c2185b"},
+}
+STRATEGY_GROUP_SPECS = {
+    "L1": {"slug": "level1", "color": "#0a6cff"},
+    "L2": {"slug": "level2", "color": "#00a35c"},
+    "L3": {"slug": "level3", "color": "#ff8a00"},
+    "L4": {"slug": "level4", "color": "#7b1fa2"},
+    "L5": {"slug": "level5", "color": "#c2185b"},
+    "L6": {"slug": "level6", "color": "#6d4c41"},
+}
+
+
+def get_group_specs(view_mode: str) -> dict[str, dict[str, str]]:
+    return CLEAN_GROUP_SPECS if view_mode == "clean_outer_seeds" else STRATEGY_GROUP_SPECS
+
+
+def get_group_order(view_mode: str) -> list[str]:
+    return list(get_group_specs(view_mode).keys())
 
 
 def get_xml_path(piece_id: str) -> Path:
@@ -68,17 +74,43 @@ def get_beat_map_path(piece_id: str) -> Path:
     return PROJECT_ROOT / f"MazurkaBL-master/beat_time/{piece_id}beat_time.csv"
 
 
-def get_predicted_events_path(piece_id: str, group_label: str) -> Path:
-    run_name = GROUP_SPECS[group_label]["run_name"]
+def get_predicted_events_path(level_slug: str, seed: int) -> Path:
     return (
         PROJECT_ROOT
-        / f"MERIX SUBMISSION/Boundary_Restart/outputs/local_runs/{piece_id}_4groups/{run_name}/predicted_events.csv.gz"
+        / f"MERIX SUBMISSION/Boundary_Restart/outputs/local_runs/clean_outer_test/M06_outer_{level_slug}_seed{seed}/predicted_events.csv.gz"
     )
 
 
-def get_summary_path(piece_id: str, group_label: str) -> Path:
-    run_name = GROUP_SPECS[group_label]["run_name"]
-    return PROJECT_ROOT / f"MERIX SUBMISSION/Boundary_Restart/outputs/local_runs/{piece_id}_4groups/{run_name}/summary.json"
+def get_summary_path(level_slug: str, seed: int) -> Path:
+    return PROJECT_ROOT / f"MERIX SUBMISSION/Boundary_Restart/reports/clean_outer_test/M06_outer_{level_slug}_seed{seed}/summary.json"
+
+
+def get_strategy_specs(group_label: str) -> dict[str, str]:
+    spec = STRATEGY_GROUP_SPECS[group_label]
+    run_root = "strategy_compare_l5l6_u70" if spec["slug"] in {"level5", "level6"} else "strategy_compare_alllevels"
+    return {"slug": spec["slug"], "color": spec["color"], "run_root": run_root}
+
+
+def get_strategy_target(group_label: str) -> str:
+    return f"{get_strategy_specs(group_label)['slug']}_boundary"
+
+
+def get_strategy_predicted_events_path(piece_id: str, group_label: str, variant: str, seed: int = 42) -> Path:
+    strategy_specs = get_strategy_specs(group_label)
+    target = f"{strategy_specs['slug']}_boundary"
+    return (
+        PROJECT_ROOT
+        / f"MERIX SUBMISSION/Boundary_Restart/outputs/local_runs/{strategy_specs['run_root']}/{piece_id}_{target}_{variant}_seed{seed}/predicted_events.csv.gz"
+    )
+
+
+def get_strategy_summary_path(piece_id: str, group_label: str, variant: str, seed: int = 42) -> Path:
+    strategy_specs = get_strategy_specs(group_label)
+    target = f"{strategy_specs['slug']}_boundary"
+    return (
+        PROJECT_ROOT
+        / f"MERIX SUBMISSION/Boundary_Restart/outputs/local_runs/{strategy_specs['run_root']}/{piece_id}_{target}_{variant}_seed{seed}/summary.json"
+    )
 
 
 @CACHE_DATA(show_spinner=False)
@@ -88,18 +120,61 @@ def load_beat_map(piece_id: str) -> pd.DataFrame:
 
 
 @CACHE_DATA(show_spinner=False)
-def load_group_events(piece_id: str, group_label: str) -> pd.DataFrame:
-    path = get_predicted_events_path(piece_id, group_label)
+def load_group_events(piece_id: str, group_label: str, seed: int) -> pd.DataFrame:
+    level_slug = CLEAN_GROUP_SPECS[group_label]["slug"]
+    path = get_predicted_events_path(level_slug, seed)
     if not path.exists():
         return pd.DataFrame(columns=["beat_idx", "detector_score"])
     frame = pd.read_csv(path)
-    keep_cols = [col for col in ["beat_idx", "detector_score", "matched_union", "frequency_target_at_beat"] if col in frame.columns]
+    frame = frame[frame["piece_id"] == piece_id].copy()
+    keep_cols = [
+        col
+        for col in [
+            "beat_idx",
+            "detector_score",
+            "matched_union",
+            "frequency_target_at_beat",
+            "matched_true_beat_idx",
+            "match_offset",
+        ]
+        if col in frame.columns
+    ]
     return frame[keep_cols].copy()
 
 
 @CACHE_DATA(show_spinner=False)
-def load_group_summary(piece_id: str, group_label: str) -> dict:
-    path = get_summary_path(piece_id, group_label)
+def load_strategy_events(piece_id: str, group_label: str, variant: str, seed: int = 42) -> pd.DataFrame:
+    path = get_strategy_predicted_events_path(piece_id, group_label, variant, seed=seed)
+    if not path.exists():
+        return pd.DataFrame(columns=["beat_idx", "detector_score"])
+    frame = pd.read_csv(path)
+    keep_cols = [
+        col
+        for col in [
+            "beat_idx",
+            "detector_score",
+            "matched_union",
+            "frequency_target_at_beat",
+            "matched_true_beat_idx",
+            "match_offset",
+        ]
+        if col in frame.columns
+    ]
+    return frame[keep_cols].copy()
+
+
+@CACHE_DATA(show_spinner=False)
+def load_group_summary(group_label: str, seed: int) -> dict:
+    level_slug = CLEAN_GROUP_SPECS[group_label]["slug"]
+    path = get_summary_path(level_slug, seed)
+    if not path.exists():
+        return {}
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+@CACHE_DATA(show_spinner=False)
+def load_strategy_summary(piece_id: str, group_label: str, variant: str, seed: int = 42) -> dict:
+    path = get_strategy_summary_path(piece_id, group_label, variant, seed=seed)
     if not path.exists():
         return {}
     return json.loads(path.read_text(encoding="utf-8"))
@@ -129,44 +204,154 @@ def map_events_to_measures(events: pd.DataFrame, beat_map: pd.DataFrame) -> list
                 "detector_score": float(getattr(row, "detector_score", 0.0)),
                 "matched_union": bool(getattr(row, "matched_union", False)),
                 "frequency_target_at_beat": float(getattr(row, "frequency_target_at_beat", 0.0)),
+                "matched_true_beat_idx": getattr(row, "matched_true_beat_idx", None),
+                "match_offset": getattr(row, "match_offset", None),
             }
         )
     return mapped
 
 
-def build_breakpoint_table(piece_id: str, selected_groups: list[str]) -> pd.DataFrame:
+def build_breakpoint_table(piece_id: str, selected_groups: list[str], seed: int) -> pd.DataFrame:
     beat_map = load_beat_map(piece_id)
     rows: list[dict] = []
     for group_label in selected_groups:
-        mapped = map_events_to_measures(load_group_events(piece_id, group_label), beat_map)
+        mapped = map_events_to_measures(load_group_events(piece_id, group_label, seed), beat_map)
         for item in mapped:
             rows.append(
                 {
                     "group": group_label,
+                    "seed": seed,
                     "beat_idx": item["beat_idx"],
                     "measure": item["measure"],
                     "beat_in_measure": item["beat_in_measure"],
                     "detector_score": item["detector_score"],
                     "matched_union": item["matched_union"],
                     "frequency_target_at_beat": item["frequency_target_at_beat"],
+                    "matched_true_beat_idx": item["matched_true_beat_idx"],
+                    "match_offset": item["match_offset"],
                 }
             )
     if not rows:
         return pd.DataFrame(
             columns=[
                 "group",
+                "seed",
                 "beat_idx",
                 "measure",
                 "beat_in_measure",
                 "detector_score",
                 "matched_union",
                 "frequency_target_at_beat",
+                "matched_true_beat_idx",
+                "match_offset",
             ]
         )
     return pd.DataFrame(rows).sort_values(["measure", "beat_in_measure", "group", "beat_idx"]).reset_index(drop=True)
 
 
-def build_annotated_musicxml(xml_path: Path, breakpoints: pd.DataFrame, selected_groups: list[str]) -> str:
+def build_strategy_breakpoint_table(piece_id: str, selected_groups: list[str], variant: str, seed: int = 42) -> pd.DataFrame:
+    beat_map = load_beat_map(piece_id)
+    rows: list[dict] = []
+    for group_label in selected_groups:
+        mapped = map_events_to_measures(load_strategy_events(piece_id, group_label, variant, seed=seed), beat_map)
+        for item in mapped:
+            rows.append(
+                {
+                    "group": group_label,
+                    "variant": variant,
+                    "seed": seed,
+                    "beat_idx": item["beat_idx"],
+                    "measure": item["measure"],
+                    "beat_in_measure": item["beat_in_measure"],
+                    "detector_score": item["detector_score"],
+                    "matched_union": item["matched_union"],
+                    "frequency_target_at_beat": item["frequency_target_at_beat"],
+                    "matched_true_beat_idx": item["matched_true_beat_idx"],
+                    "match_offset": item["match_offset"],
+                }
+            )
+    if not rows:
+        return pd.DataFrame(
+            columns=[
+                "group",
+                "variant",
+                "seed",
+                "beat_idx",
+                "measure",
+                "beat_in_measure",
+                "detector_score",
+                "matched_union",
+                "frequency_target_at_beat",
+                "matched_true_beat_idx",
+                "match_offset",
+            ]
+        )
+    return pd.DataFrame(rows).sort_values(["measure", "beat_in_measure", "group", "beat_idx"]).reset_index(drop=True)
+
+
+def build_summary_table(piece_id: str, selected_groups: list[str], seed: int, breakpoints: pd.DataFrame) -> pd.DataFrame:
+    summary_rows = []
+    for group_label in selected_groups:
+        group_df = breakpoints[breakpoints["group"] == group_label].copy()
+        summary = load_group_summary(group_label, seed)
+        union_metrics = summary.get("union_metrics", {})
+        summary_rows.append(
+            {
+                "group": group_label,
+                "seed": seed,
+                "events": int(len(group_df)) if not group_df.empty else int(union_metrics.get("pred_events", 0)),
+                "measures": int(group_df["measure"].nunique()) if not group_df.empty else 0,
+                "threshold": union_metrics.get("threshold"),
+                "precision": union_metrics.get("union_precision"),
+                "union_recall": union_metrics.get("union_recall"),
+                "weighted_recall": union_metrics.get("weighted_recall"),
+                "consensus_recall": union_metrics.get("consensus_recall"),
+                "frozen_epochs": summary.get("frozen_epochs"),
+            }
+        )
+    return pd.DataFrame(summary_rows)
+
+
+def build_strategy_summary_table(
+    piece_id: str,
+    selected_groups: list[str],
+    variant: str,
+    breakpoints: pd.DataFrame,
+    seed: int = 42,
+) -> pd.DataFrame:
+    summary_rows = []
+    for group_label in selected_groups:
+        group_df = breakpoints[breakpoints["group"] == group_label].copy()
+        summary = load_strategy_summary(piece_id, group_label, variant, seed=seed)
+        union_metrics = summary.get("union_metrics", {})
+        floors = summary.get("precision_floors", {})
+        summary_rows.append(
+            {
+                "group": group_label,
+                "variant": variant,
+                "events": int(len(group_df)) if not group_df.empty else int(union_metrics.get("pred_events", 0)),
+                "measures": int(group_df["measure"].nunique()) if not group_df.empty else 0,
+                "precision_metric": summary.get("precision_metric"),
+                "precision_floors": json.dumps(floors, ensure_ascii=False, sort_keys=True),
+                "threshold": union_metrics.get("threshold"),
+                "precision": union_metrics.get("union_precision"),
+                "freq_precision": union_metrics.get("frequency_weighted_precision"),
+                "cons_precision": union_metrics.get("consensus_precision"),
+                "union_recall": union_metrics.get("union_recall"),
+                "weighted_recall": union_metrics.get("weighted_recall"),
+                "consensus_recall": union_metrics.get("consensus_recall"),
+                "best_epoch": summary.get("best_epoch"),
+            }
+        )
+    return pd.DataFrame(summary_rows)
+
+
+def build_annotated_musicxml(
+    xml_path: Path,
+    breakpoints: pd.DataFrame,
+    selected_groups: list[str],
+    group_specs: dict[str, dict[str, str]],
+) -> str:
     tree = ET.parse(xml_path)
     root = tree.getroot()
 
@@ -190,7 +375,7 @@ def build_annotated_musicxml(xml_path: Path, breakpoints: pd.DataFrame, selected
                 items = by_measure_group[measure_no].get(group_label, [])
                 if not items:
                     continue
-                color = GROUP_SPECS[group_label]["color"]
+                color = group_specs[group_label]["color"]
                 beat_text = ",".join(f"b{item['beat_in_measure']}" for item in items[:4])
                 if len(items) > 4:
                     beat_text += ",..."
@@ -208,7 +393,12 @@ def build_annotated_musicxml(xml_path: Path, breakpoints: pd.DataFrame, selected
     return ET.tostring(root, encoding="unicode")
 
 
-def render_score(xml_text: str, group_counts: dict[str, int], height: int = 1050) -> None:
+def render_score(
+    xml_text: str,
+    group_counts: dict[str, int],
+    group_specs: dict[str, dict[str, str]],
+    height: int = 1000,
+) -> None:
     if components is None:
         raise RuntimeError("streamlit is not installed; use this module via `streamlit run app.py`.")
     if not xml_text.lstrip().startswith("<?xml"):
@@ -217,10 +407,10 @@ def render_score(xml_text: str, group_counts: dict[str, int], height: int = 1050
     xml_b64_js = json.dumps(xml_b64)
 
     legend_html = []
-    for group_label in GROUP_ORDER:
+    for group_label in group_specs:
         if group_label not in group_counts:
             continue
-        color = GROUP_SPECS[group_label]["color"]
+        color = group_specs[group_label]["color"]
         count = group_counts[group_label]
         legend_html.append(
             f'<span style="display:inline-block;background:{color};color:white;'
@@ -285,61 +475,68 @@ def render_score(xml_text: str, group_counts: dict[str, int], height: int = 1050
     components.html(html, height=height, scrolling=True)
 
 
-def render_piece_tab(piece_id: str, selected_groups: list[str]) -> None:
+def render_seed_panel(piece_id: str, selected_groups: list[str], seed: int) -> None:
     xml_path = get_xml_path(piece_id)
-    beat_map_path = get_beat_map_path(piece_id)
-    breakpoints = build_breakpoint_table(piece_id, selected_groups)
+    breakpoints = build_breakpoint_table(piece_id, selected_groups, seed)
+    summary_df = build_summary_table(piece_id, selected_groups, seed, breakpoints)
 
-    summary_rows = []
-    for group_label in selected_groups:
-        group_df = breakpoints[breakpoints["group"] == group_label].copy()
-        summary = load_group_summary(piece_id, group_label)
-        union_metrics = summary.get("union_metrics", {})
-        summary_rows.append(
-            {
-                "group": group_label,
-                "events": int(len(group_df)),
-                "measures": int(group_df["measure"].nunique()) if not group_df.empty else 0,
-                "threshold": union_metrics.get("threshold"),
-                "precision": union_metrics.get("union_precision"),
-                "union_recall": union_metrics.get("union_recall"),
-                "weighted_recall": union_metrics.get("weighted_recall"),
-            }
+    st.markdown(f"### Seed {seed}")
+    if breakpoints.empty:
+        st.info("当前本地还没有这个 seed 的事件表，只显示摘要。")
+    else:
+        annotated_xml = build_annotated_musicxml(xml_path, breakpoints, selected_groups, CLEAN_GROUP_SPECS)
+        render_score(
+            annotated_xml,
+            group_counts={row["group"]: int(row["events"]) for _, row in summary_df.iterrows()},
+            group_specs=CLEAN_GROUP_SPECS,
+            height=980,
         )
-    summary_df = pd.DataFrame(summary_rows)
 
-    annotated_xml = build_annotated_musicxml(xml_path, breakpoints, selected_groups)
-    render_score(
-        annotated_xml,
-        group_counts={row["group"]: int(row["events"]) for row in summary_rows},
-        height=1080,
-    )
+    st.dataframe(summary_df, use_container_width=True, hide_index=True)
+    st.dataframe(breakpoints, use_container_width=True, hide_index=True)
 
-    col_left, col_right = st.columns([1, 1])
-    with col_left:
-        st.subheader("四层结果概览")
-        st.dataframe(summary_df, use_container_width=True, hide_index=True)
-    with col_right:
-        st.subheader("路径")
-        st.code(str(xml_path))
-        st.code(str(beat_map_path))
 
-    st.subheader("断点列表")
+def render_strategy_panel(piece_id: str, selected_groups: list[str], variant: str, seed: int = 42) -> None:
+    xml_path = get_xml_path(piece_id)
+    breakpoints = build_strategy_breakpoint_table(piece_id, selected_groups, variant, seed=seed)
+    summary_df = build_strategy_summary_table(piece_id, selected_groups, variant, breakpoints, seed=seed)
+
+    st.markdown(f"### {STRATEGY_LABELS.get(variant, variant)}")
+    if breakpoints.empty:
+        st.info("当前本地还没有这个策略的事件表，只显示摘要。")
+    else:
+        annotated_xml = build_annotated_musicxml(xml_path, breakpoints, selected_groups, STRATEGY_GROUP_SPECS)
+        render_score(
+            annotated_xml,
+            group_counts={row["group"]: int(row["events"]) for _, row in summary_df.iterrows()},
+            group_specs=STRATEGY_GROUP_SPECS,
+            height=980,
+        )
+
+    st.dataframe(summary_df, use_container_width=True, hide_index=True)
     st.dataframe(breakpoints, use_container_width=True, hide_index=True)
 
 
 def main() -> None:
     if st is None:
         raise RuntimeError("streamlit is not installed; install it before running this app.")
-    st.set_page_config(page_title="Mazurka Four-Level Breakpoint Visualizer", layout="wide")
-    st.title("Mazurka Four-Level Breakpoint Visualizer")
-    st.caption("使用当前 Boundary_Restart 的 TCN direct 四层结果，在乐谱上叠加显示断点")
-
-    selected_groups = st.sidebar.multiselect(
-        "显示层级",
-        options=GROUP_ORDER,
-        default=GROUP_ORDER,
+    st.set_page_config(page_title="Mazurka Clean Outer Breakpoint Visualizer", layout="wide")
+    st.title("Mazurka Breakpoint Visualizer")
+    view_mode = st.sidebar.radio(
+        "展示模式",
+        options=["clean_outer_seeds", "strategy_compare"],
+        format_func=lambda value: {
+            "clean_outer_seeds": "Clean Outer Seed42 vs Seed44",
+            "strategy_compare": "Baseline vs Consensus Guarded",
+        }[value],
     )
+    if view_mode == "clean_outer_seeds":
+        st.caption("展示 clean outer test 下的五层结果；每层分别显示 seed42 和 seed44。")
+    else:
+        st.caption("展示 5 首曲子、6 个 level 下的 baseline 与新策略对照；策略模式下高层拆成 L5 和 L6，并使用 union precision floor 0.7 的新结果。")
+
+    group_order = get_group_order(view_mode)
+    selected_groups = st.sidebar.multiselect("显示层级", options=group_order, default=group_order)
     if not selected_groups:
         st.warning("请至少选择一层。")
         return
@@ -347,7 +544,17 @@ def main() -> None:
     tabs = st.tabs(SUPPORTED_PIECES)
     for tab, piece_id in zip(tabs, SUPPORTED_PIECES):
         with tab:
-            render_piece_tab(piece_id, selected_groups)
+            st.subheader(piece_id)
+            st.code(str(get_xml_path(piece_id)))
+            cols = st.columns(2)
+            if view_mode == "clean_outer_seeds":
+                for col, seed in zip(cols, SEED_ORDER):
+                    with col:
+                        render_seed_panel(piece_id, selected_groups, seed)
+            else:
+                for col, variant in zip(cols, STRATEGY_ORDER):
+                    with col:
+                        render_strategy_panel(piece_id, selected_groups, variant, seed=42)
 
 
 if __name__ == "__main__":

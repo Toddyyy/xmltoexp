@@ -1,0 +1,620 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import subprocess
+import sys
+from dataclasses import asdict
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import torch
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from torch.utils.data import DataLoader
+
+from boundary_restart.config import load_config, resolve_path, threshold_grid
+from boundary_restart.features import PeakConfig
+from boundary_restart.metrics import evaluate_union_frequency_sequences, extract_events, greedy_match_pairs
+from boundary_restart.models import build_sequence_model
+from boundary_restart.table_io import load_table
+from train_piece_union_protocol import (
+    PieceUnionDataset,
+    apply_piece_protocol_split,
+    build_piece_union_frame,
+    collate_piece_union,
+    detector_sequence_maps,
+    piece_samples_from_frame,
+    predict_detector,
+)
+
+
+DEFAULT_PIECES = ["M06-1", "M06-2", "M06-3", "M17-1", "M30-1"]
+SEED = 42
+TRAIN_FREQ_FLOOR = 0.05
+MIN_UNION_PRECISION = 0.70
+MAX_EPOCHS = 60
+EARLY_STOP_PATIENCE = 10
+DEVICE = "mps"
+CANDIDATE_RADIUS = 1
+
+TARGET_SPECS = {
+    "L6": ("level6_boundary", 0),
+    "L5+": ("level5plus_split56_boundary", 2),
+    "L4+": ("level4plus_split56_boundary", 2),
+}
+
+
+def train_detector(
+    train_script: Path,
+    config_path: Path,
+    *,
+    outer_piece: str,
+    backbone: str,
+    seed: int,
+    label: str,
+    target: str,
+    cumulative_merge_tolerance: int,
+    output_dir: Path,
+) -> None:
+    summary_path = output_dir / "summary.json"
+    if summary_path.exists() and (output_dir / "detector_best.pt").exists():
+        return
+    cmd = [
+        sys.executable,
+        str(train_script),
+        "--config",
+        str(config_path),
+        "--heldout_piece",
+        outer_piece,
+        "--model",
+        backbone,
+        "--device",
+        DEVICE,
+        "--seed",
+        str(seed),
+        "--detector_target",
+        target,
+        "--selection_metric",
+        "weighted_recall",
+        "--precision_metric",
+        "union_precision",
+        "--min_precision",
+        str(MIN_UNION_PRECISION),
+        "--epochs",
+        str(MAX_EPOCHS),
+        "--early_stop_patience",
+        str(EARLY_STOP_PATIENCE),
+        "--skip_stage_grading",
+        "--min_train_frequency_target",
+        str(TRAIN_FREQ_FLOOR),
+        "--output_dir",
+        str(output_dir),
+    ]
+    if cumulative_merge_tolerance > 0:
+        cmd.extend(["--cumulative_merge_tolerance", str(cumulative_merge_tolerance)])
+    print(f"TRAIN {outer_piece} {label} backbone={backbone}")
+    subprocess.run(cmd, check=True)
+
+
+def load_threshold(summary_path: Path) -> float:
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    return float(summary["union_metrics"]["threshold"])
+
+
+def load_detector_predictions(
+    project_root: Path,
+    cfg: dict,
+    *,
+    outer_piece: str,
+    detector_target: str,
+    checkpoint_dir: Path,
+    cumulative_merge_tolerance: int,
+) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
+    checkpoint = torch.load(checkpoint_dir / "detector_best.pt", map_location="cpu", weights_only=False)
+    feature_cols = list(checkpoint["feature_columns"])
+
+    table_path = resolve_path(cfg, cfg["data"]["beat_table_path"])
+    df = load_table(table_path)
+    df = apply_piece_protocol_split(df, heldout_pieces=[outer_piece])
+
+    peak_cfg = PeakConfig(
+        distance=int(cfg.get("data", {}).get("peak_distance", 6)),
+        height=float(cfg.get("data", {}).get("peak_height", 0.15)),
+        prominence=float(cfg.get("data", {}).get("peak_prominence", 0.05)),
+    )
+    beat_unit_fallback = float(cfg.get("data", {}).get("beat_unit_fallback", 1.0))
+    piece_df = build_piece_union_frame(
+        df,
+        feature_cols=feature_cols,
+        target_mode=detector_target,
+        peak_cfg=peak_cfg,
+        beat_unit_fallback=beat_unit_fallback,
+        cumulative_merge_tolerance=int(cumulative_merge_tolerance),
+    )
+
+    mean = np.asarray(checkpoint["mean"], dtype=np.float32)
+    std = np.asarray(checkpoint["std"], dtype=np.float32)
+    samples = piece_samples_from_frame(piece_df, feature_cols, split="train") + piece_samples_from_frame(
+        piece_df, feature_cols, split="val"
+    )
+    ds = PieceUnionDataset(samples, mean=mean, std=std)
+    loader = DataLoader(ds, batch_size=64, shuffle=False, collate_fn=collate_piece_union)
+
+    model = build_sequence_model(
+        checkpoint["model_type"],
+        input_dim=len(feature_cols),
+        cfg=cfg,
+        output_dim=1,
+    )
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model.to(torch.device("cpu"))
+    pred_df = predict_detector(model, loader, device=torch.device("cpu"))
+    return piece_df, pred_df, feature_cols
+
+
+def event_mask_from_scores(
+    pred_df: pd.DataFrame,
+    threshold: float,
+    *,
+    radius: int,
+    min_distance: int,
+    prominence: float,
+) -> dict[str, np.ndarray]:
+    masks = {}
+    ordered = pred_df.sort_values(["sample_id", "beat_idx"])
+    for sample_id, group in ordered.groupby("sample_id", sort=False):
+        scores = group["detector_score"].to_numpy(dtype=np.float32)
+        events = extract_events(scores, threshold=float(threshold), min_distance=int(min_distance), prominence=float(prominence))
+        mask = np.zeros(len(group), dtype=bool)
+        for event in events.tolist():
+            start = max(0, int(event) - int(radius))
+            end = min(len(group), int(event) + int(radius) + 1)
+            mask[start:end] = True
+        masks[str(sample_id)] = mask
+    return masks
+
+
+def sequence_lookup(pred_df: pd.DataFrame) -> dict[str, np.ndarray]:
+    seq_scores, _, _ = detector_sequence_maps(pred_df)
+    return {str(k): np.asarray(v, dtype=np.float32) for k, v in seq_scores.items()}
+
+
+def assemble_candidate_frame(
+    l6_piece_df: pd.DataFrame,
+    l6_scores: dict[str, np.ndarray],
+    l5_scores: dict[str, np.ndarray],
+    l4_scores: dict[str, np.ndarray],
+    l5_mask: dict[str, np.ndarray],
+    l4_mask: dict[str, np.ndarray],
+) -> pd.DataFrame:
+    rows = []
+    ordered = l6_piece_df.sort_values(["piece_sample_id", "beat_idx"]).copy()
+    for sample_id, group in ordered.groupby("piece_sample_id", sort=False):
+        sample_id = str(sample_id)
+        group = group.reset_index(drop=True)
+        candidate = np.logical_or(l5_mask[sample_id], l4_mask[sample_id])
+        if not np.any(candidate):
+            continue
+        sub = group.loc[candidate].copy()
+        sub["l6_base_score"] = l6_scores[sample_id][candidate]
+        sub["l5_score"] = l5_scores[sample_id][candidate]
+        sub["l4_score"] = l4_scores[sample_id][candidate]
+        sub["candidate_from_l5"] = l5_mask[sample_id][candidate].astype(np.float32)
+        sub["candidate_from_l4"] = l4_mask[sample_id][candidate].astype(np.float32)
+        sub["rerank_train_label"] = (sub["frequency_target"].to_numpy(dtype=np.float32) >= TRAIN_FREQ_FLOOR).astype(np.int64)
+        rows.append(sub)
+    return pd.concat(rows, axis=0, ignore_index=True) if rows else pd.DataFrame()
+
+
+def candidate_coverage(candidate_df: pd.DataFrame, l6_piece_df: pd.DataFrame) -> tuple[int, int]:
+    candidate_map = {
+        str(sample_id): group["beat_idx"].to_numpy(dtype=np.int32)
+        for sample_id, group in candidate_df.groupby("piece_sample_id", sort=False)
+    }
+    total_matches = 0
+    total_true = 0
+    val_truth = l6_piece_df[l6_piece_df["protocol_split"] == "val"].sort_values(["piece_sample_id", "beat_idx"]).copy()
+    for sample_id, group in val_truth.groupby("piece_sample_id", sort=False):
+        sample_id = str(sample_id)
+        true_events = np.flatnonzero(group["union_target"].to_numpy(dtype=np.float32) > 0.5).astype(np.int32)
+        cand_events = candidate_map.get(sample_id, np.empty(0, dtype=np.int32))
+        match_pairs = greedy_match_pairs(cand_events, true_events, tolerance=1)
+        total_matches += len(match_pairs)
+        total_true += int(true_events.size)
+    return total_matches, total_true
+
+
+def build_full_sequence_scores(piece_df: pd.DataFrame, rerank_df: pd.DataFrame) -> dict[str, np.ndarray]:
+    rerank_map = {}
+    if not rerank_df.empty:
+        for sample_id, group in rerank_df.groupby("piece_sample_id", sort=False):
+            rerank_map[str(sample_id)] = {
+                int(row.beat_idx): float(row.rerank_score)
+                for row in group.itertuples(index=False)
+            }
+    scores = {}
+    ordered = piece_df[piece_df["protocol_split"] == "val"].sort_values(["piece_sample_id", "beat_idx"]).copy()
+    for sample_id, group in ordered.groupby("piece_sample_id", sort=False):
+        sample_id = str(sample_id)
+        seq = np.zeros(len(group), dtype=np.float32)
+        beat_to_score = rerank_map.get(sample_id, {})
+        for idx, beat_idx in enumerate(group["beat_idx"].astype(int).tolist()):
+            if beat_idx in beat_to_score:
+                seq[idx] = beat_to_score[beat_idx]
+        scores[sample_id] = seq
+    return scores
+
+
+def search_threshold_strict(
+    *,
+    sequence_scores: dict[str, np.ndarray],
+    sequence_union_labels: dict[str, np.ndarray],
+    sequence_frequency_targets: dict[str, np.ndarray],
+    thresholds: np.ndarray,
+    tolerance: int,
+    min_distance: int,
+    consensus_threshold: float,
+    prominence: float,
+    min_union_precision: float,
+):
+    best = None
+    for threshold in thresholds.tolist():
+        metrics = evaluate_union_frequency_sequences(
+            sequence_scores=sequence_scores,
+            sequence_union_labels=sequence_union_labels,
+            sequence_frequency_targets=sequence_frequency_targets,
+            threshold=float(threshold),
+            tolerance=tolerance,
+            min_distance=min_distance,
+            consensus_threshold=consensus_threshold,
+            prominence=prominence,
+        )
+        if metrics.union_precision < float(min_union_precision):
+            continue
+        current_key = (
+            metrics.weighted_recall,
+            metrics.frequency_weighted_precision,
+            metrics.consensus_precision,
+            metrics.union_precision,
+            metrics.consensus_recall,
+            -float(metrics.mean_offset or 1e9),
+            -metrics.threshold,
+        )
+        if best is None:
+            best = metrics
+            continue
+        best_key = (
+            best.weighted_recall,
+            best.frequency_weighted_precision,
+            best.consensus_precision,
+            best.union_precision,
+            best.consensus_recall,
+            -float(best.mean_offset or 1e9),
+            -best.threshold,
+        )
+        if current_key > best_key:
+            best = metrics
+    return best
+
+
+def row_from_metrics(
+    *,
+    piece_id: str,
+    method: str,
+    candidate_matches: int,
+    candidate_true_events: int,
+    candidate_coverage: float,
+    metrics,
+    meets_union_floor: bool,
+    threshold: float | None,
+    note: str = "",
+) -> dict[str, object]:
+    if metrics is None:
+        return {
+            "piece_id": piece_id,
+            "method": method,
+            "candidate_matches": int(candidate_matches),
+            "candidate_true_events": int(candidate_true_events),
+            "candidate_coverage": float(candidate_coverage),
+            "meets_union_floor": bool(meets_union_floor),
+            "threshold": threshold,
+            "union_precision": np.nan,
+            "frequency_weighted_precision": np.nan,
+            "consensus_precision": np.nan,
+            "union_recall": np.nan,
+            "weighted_recall": np.nan,
+            "consensus_recall": np.nan,
+            "pred_events": np.nan,
+            "matches": np.nan,
+            "note": note,
+        }
+    payload = asdict(metrics)
+    payload.update(
+        {
+            "piece_id": piece_id,
+            "method": method,
+            "candidate_matches": int(candidate_matches),
+            "candidate_true_events": int(candidate_true_events),
+            "candidate_coverage": float(candidate_coverage),
+            "meets_union_floor": bool(meets_union_floor),
+            "note": note,
+        }
+    )
+    return payload
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--backbone", default="tcn", choices=["tcn", "bilstm"])
+    parser.add_argument("--pieces", nargs="+", default=DEFAULT_PIECES)
+    parser.add_argument("--tag_suffix", default="")
+    args = parser.parse_args()
+
+    project_root = Path(__file__).resolve().parent
+    cfg = load_config(project_root / "configs/salience_grouped3_hi8_score_only_xml_curated.yaml")
+    train_script = project_root / "train_piece_union_protocol.py"
+    config_path = project_root / "configs/salience_grouped3_hi8_score_only_xml_curated.yaml"
+
+    suffix = f"_{args.tag_suffix}" if args.tag_suffix else ""
+    run_root = project_root / f"outputs/local_runs/l6_candidate_rerank_multipiece_seed42_t0p05_p70_{args.backbone}{suffix}"
+    report_root = project_root / f"reports/l6_candidate_rerank_multipiece_seed42_t0p05_p70_{args.backbone}{suffix}"
+    run_root.mkdir(parents=True, exist_ok=True)
+    report_root.mkdir(parents=True, exist_ok=True)
+
+    eval_cfg = cfg.get("evaluation", {})
+    thresholds = threshold_grid(cfg)
+    tolerance = int(eval_cfg.get("event_tolerance", 1))
+    min_distance = int(eval_cfg.get("min_distance", 6))
+    prominence = float(eval_cfg.get("prominence", 0.0))
+    consensus_threshold = float(eval_cfg.get("consensus_threshold", 0.5))
+
+    rows: list[dict[str, object]] = []
+    for outer_piece in args.pieces:
+        piece_run_root = run_root / outer_piece
+        piece_report_root = report_root / outer_piece
+        piece_run_root.mkdir(parents=True, exist_ok=True)
+        piece_report_root.mkdir(parents=True, exist_ok=True)
+
+        for label, (target, cumulative_merge_tolerance) in TARGET_SPECS.items():
+            train_detector(
+                train_script,
+                config_path,
+                outer_piece=outer_piece,
+                backbone=args.backbone,
+                seed=SEED,
+                label=label,
+                target=target,
+                cumulative_merge_tolerance=cumulative_merge_tolerance,
+                output_dir=piece_run_root / target,
+            )
+
+        l6_dir = piece_run_root / TARGET_SPECS["L6"][0]
+        l5_dir = piece_run_root / TARGET_SPECS["L5+"][0]
+        l4_dir = piece_run_root / TARGET_SPECS["L4+"][0]
+
+        l6_piece_df, l6_pred_df, feature_cols = load_detector_predictions(
+            project_root,
+            cfg,
+            outer_piece=outer_piece,
+            detector_target=TARGET_SPECS["L6"][0],
+            checkpoint_dir=l6_dir,
+            cumulative_merge_tolerance=TARGET_SPECS["L6"][1],
+        )
+        _, l5_pred_df, _ = load_detector_predictions(
+            project_root,
+            cfg,
+            outer_piece=outer_piece,
+            detector_target=TARGET_SPECS["L5+"][0],
+            checkpoint_dir=l5_dir,
+            cumulative_merge_tolerance=TARGET_SPECS["L5+"][1],
+        )
+        _, l4_pred_df, _ = load_detector_predictions(
+            project_root,
+            cfg,
+            outer_piece=outer_piece,
+            detector_target=TARGET_SPECS["L4+"][0],
+            checkpoint_dir=l4_dir,
+            cumulative_merge_tolerance=TARGET_SPECS["L4+"][1],
+        )
+
+        l5_threshold = load_threshold(l5_dir / "summary.json")
+        l4_threshold = load_threshold(l4_dir / "summary.json")
+
+        l6_scores = sequence_lookup(l6_pred_df)
+        l5_scores = sequence_lookup(l5_pred_df)
+        l4_scores = sequence_lookup(l4_pred_df)
+        l5_mask = event_mask_from_scores(
+            l5_pred_df,
+            l5_threshold,
+            radius=CANDIDATE_RADIUS,
+            min_distance=min_distance,
+            prominence=prominence,
+        )
+        l4_mask = event_mask_from_scores(
+            l4_pred_df,
+            l4_threshold,
+            radius=CANDIDATE_RADIUS,
+            min_distance=min_distance,
+            prominence=prominence,
+        )
+
+        candidate_df = assemble_candidate_frame(
+            l6_piece_df,
+            l6_scores=l6_scores,
+            l5_scores=l5_scores,
+            l4_scores=l4_scores,
+            l5_mask=l5_mask,
+            l4_mask=l4_mask,
+        )
+        candidate_df.to_csv(piece_report_root / "candidate_frame.csv.gz", index=False, compression="gzip")
+
+        val_candidate_df = candidate_df[candidate_df["protocol_split"] == "val"].copy()
+        coverage_matches, coverage_true = candidate_coverage(val_candidate_df, l6_piece_df)
+        coverage_ratio = float(coverage_matches / coverage_true) if coverage_true > 0 else 0.0
+
+        direct_summary = json.loads((l6_dir / "summary.json").read_text(encoding="utf-8"))["union_metrics"]
+        rows.append(
+            {
+                "piece_id": outer_piece,
+                "method": "direct_l6",
+                "candidate_matches": 0,
+                "candidate_true_events": 0,
+                "candidate_coverage": 0.0,
+                "meets_union_floor": float(direct_summary["union_precision"]) >= MIN_UNION_PRECISION,
+                "threshold": float(direct_summary["threshold"]),
+                "union_precision": float(direct_summary["union_precision"]),
+                "frequency_weighted_precision": float(direct_summary["frequency_weighted_precision"]),
+                "consensus_precision": float(direct_summary["consensus_precision"]),
+                "union_recall": float(direct_summary["union_recall"]),
+                "weighted_recall": float(direct_summary["weighted_recall"]),
+                "consensus_recall": float(direct_summary["consensus_recall"]),
+                "pred_events": int(direct_summary["pred_events"]),
+                "matches": int(direct_summary["matches"]),
+                "note": "",
+            }
+        )
+
+        train_df = candidate_df[candidate_df["protocol_split"] == "train"].copy()
+        val_df = candidate_df[candidate_df["protocol_split"] == "val"].copy()
+        if train_df.empty or val_df.empty:
+            rows.append(
+                row_from_metrics(
+                    piece_id=outer_piece,
+                    method="rerank_l5_l4_to_l6_strict",
+                    candidate_matches=coverage_matches,
+                    candidate_true_events=coverage_true,
+                    candidate_coverage=coverage_ratio,
+                    metrics=None,
+                    meets_union_floor=False,
+                    threshold=None,
+                    note="empty_candidate_split",
+                )
+            )
+            continue
+
+        model_features = list(feature_cols) + [
+            "l6_base_score",
+            "l5_score",
+            "l4_score",
+            "candidate_from_l5",
+            "candidate_from_l4",
+        ]
+        x_train = train_df[model_features].to_numpy(dtype=np.float32)
+        y_train = train_df["rerank_train_label"].to_numpy(dtype=np.int64)
+        if np.unique(y_train).size < 2:
+            rows.append(
+                row_from_metrics(
+                    piece_id=outer_piece,
+                    method="rerank_l5_l4_to_l6_strict",
+                    candidate_matches=coverage_matches,
+                    candidate_true_events=coverage_true,
+                    candidate_coverage=coverage_ratio,
+                    metrics=None,
+                    meets_union_floor=False,
+                    threshold=None,
+                    note="single_class_train",
+                )
+            )
+            continue
+
+        reranker = Pipeline(
+            [
+                ("scaler", StandardScaler()),
+                (
+                    "clf",
+                    LogisticRegression(
+                        max_iter=4000,
+                        class_weight="balanced",
+                        random_state=SEED,
+                    ),
+                ),
+            ]
+        )
+        sample_weight = 1.0 + train_df["frequency_target"].to_numpy(dtype=np.float32) * 4.0
+        reranker.fit(x_train, y_train, clf__sample_weight=sample_weight)
+
+        val_df = val_df.copy()
+        val_df["rerank_score"] = reranker.predict_proba(val_df[model_features].to_numpy(dtype=np.float32))[:, 1].astype(np.float32)
+        val_df.to_csv(piece_report_root / "val_candidates.csv.gz", index=False, compression="gzip")
+
+        sequence_scores = build_full_sequence_scores(l6_piece_df, val_df)
+        sequence_union = {}
+        sequence_frequency = {}
+        ordered_truth = l6_piece_df[l6_piece_df["protocol_split"] == "val"].sort_values(["piece_sample_id", "beat_idx"]).copy()
+        for sample_id, group in ordered_truth.groupby("piece_sample_id", sort=False):
+            sequence_union[str(sample_id)] = group["union_target"].to_numpy(dtype=np.float32)
+            sequence_frequency[str(sample_id)] = group["frequency_target"].to_numpy(dtype=np.float32)
+
+        strict_metrics = search_threshold_strict(
+            sequence_scores=sequence_scores,
+            sequence_union_labels=sequence_union,
+            sequence_frequency_targets=sequence_frequency,
+            thresholds=thresholds,
+            tolerance=tolerance,
+            min_distance=min_distance,
+            consensus_threshold=consensus_threshold,
+            prominence=prominence,
+            min_union_precision=MIN_UNION_PRECISION,
+        )
+        rows.append(
+            row_from_metrics(
+                piece_id=outer_piece,
+                method="rerank_l5_l4_to_l6_strict",
+                candidate_matches=coverage_matches,
+                candidate_true_events=coverage_true,
+                candidate_coverage=coverage_ratio,
+                metrics=strict_metrics,
+                meets_union_floor=strict_metrics is not None,
+                threshold=None if strict_metrics is None else float(strict_metrics.threshold),
+                note="" if strict_metrics is not None else "no_valid_threshold",
+            )
+        )
+
+        piece_df = pd.DataFrame([row for row in rows if row["piece_id"] == outer_piece])
+        piece_df.to_csv(piece_report_root / "leaderboard.csv", index=False)
+
+    all_results = pd.DataFrame(rows)
+    all_results.to_csv(report_root / "all_results.csv", index=False)
+
+    summary = (
+        all_results.groupby("method", as_index=False)
+        .agg(
+            pieces=("piece_id", "count"),
+            valid_count=("meets_union_floor", "sum"),
+            mean_union_precision=("union_precision", "mean"),
+            mean_weighted_recall=("weighted_recall", "mean"),
+            mean_consensus_recall=("consensus_recall", "mean"),
+            mean_candidate_coverage=("candidate_coverage", "mean"),
+        )
+    )
+    summary.to_csv(report_root / "summary_mean.csv", index=False)
+
+    with (report_root / "config.json").open("w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "pieces": args.pieces,
+                "seed": SEED,
+                "backbone": args.backbone,
+                "train_frequency_floor": TRAIN_FREQ_FLOOR,
+                "min_union_precision": MIN_UNION_PRECISION,
+                "candidate_mode": "L5+L4 -> L6 rerank",
+                "final_eval_truth_changed": False,
+            },
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    print(report_root / "all_results.csv")
+    print(report_root / "summary_mean.csv")
+    print(summary.to_csv(index=False))
+
+
+if __name__ == "__main__":
+    main()

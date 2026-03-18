@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import random
 import re
+from collections import deque
 from pathlib import Path
 
 import numpy as np
@@ -18,6 +20,12 @@ from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
 from boundary_restart.config import load_config, resolve_path, threshold_grid
+from boundary_restart.cumulative_targets import (
+    COMPONENT_RAW_LEVELS,
+    build_piece_frequency_for_raw_levels,
+    build_topdown_cumulative_frequency,
+    cumulative_components_for_target,
+)
 from boundary_restart.derived_features import add_highlevel_derived_features
 from boundary_restart.features import PeakConfig, boundary_probs_to_binary, load_boundary_npz, replace_level_suffix
 from boundary_restart.metrics import (
@@ -37,6 +45,15 @@ from boundary_restart.table_io import feature_columns, load_table
 
 RAW_LEVEL_TARGET_RE = re.compile(r"^level([1-6])_boundary$")
 RAW_LEVEL_GROUP_TARGETS = {
+    "level1plus_boundary": (1, 2, 3, 4, 5, 6),
+    "level2plus_boundary": (2, 3, 4, 5, 6),
+    "level3plus_boundary": (3, 4, 5, 6),
+    "level4plus_boundary": (4, 5, 6),
+    "level5plus_split56_boundary": (5, 6),
+    "level1plus_split56_boundary": (1, 2, 3, 4, 5, 6),
+    "level2plus_split56_boundary": (2, 3, 4, 5, 6),
+    "level3plus_split56_boundary": (3, 4, 5, 6),
+    "level4plus_split56_boundary": (4, 5, 6),
     "level34_boundary": (3, 4),
     "level56_boundary": (5, 6),
 }
@@ -181,10 +198,15 @@ def build_piece_union_frame(
     target_mode: str,
     peak_cfg: PeakConfig,
     beat_unit_fallback: float,
+    cumulative_merge_tolerance: int = 0,
+    cumulative_component_weights: dict[str, float] | None = None,
 ) -> pd.DataFrame:
     frame = df.copy()
+    cumulative_components = cumulative_components_for_target(target_mode)
     raw_levels = parse_raw_level_targets(target_mode)
-    if raw_levels is not None:
+    if cumulative_components is not None and int(cumulative_merge_tolerance) > 0:
+        pass
+    elif raw_levels is not None:
         if "source_path" not in frame.columns:
             raise ValueError("raw level targets require source_path in the beat table")
         detector_binary = np.zeros(len(frame), dtype=np.float32)
@@ -215,12 +237,13 @@ def build_piece_union_frame(
     agg_spec: dict[str, str] = {
         "protocol_split": "first",
         "num_beats": "first",
-        "detector_binary": "mean",
         "low_binary": "mean",
         "mid_binary": "mean",
         "high_binary": "mean",
         "sample_id": pd.Series.nunique,
     }
+    if "detector_binary" in frame.columns:
+        agg_spec["detector_binary"] = "mean"
     for col in feature_cols:
         agg_spec[col] = "first"
 
@@ -228,9 +251,30 @@ def build_piece_union_frame(
         frame.sort_values(["piece_id", "beat_idx", "sample_id"])
         .groupby(["piece_id", "beat_idx"], sort=False)
         .agg(agg_spec)
-        .rename(columns={"detector_binary": "frequency_target", "sample_id": "performer_count"})
+        .rename(columns={"sample_id": "performer_count"})
         .reset_index()
     )
+    if cumulative_components is not None and int(cumulative_merge_tolerance) > 0:
+        component_map = {
+            component_name: build_piece_frequency_for_raw_levels(
+                frame,
+                raw_levels=COMPONENT_RAW_LEVELS[component_name],
+                peak_cfg=peak_cfg,
+                beat_unit_fallback=beat_unit_fallback,
+            )
+            for component_name in cumulative_components
+        }
+        merged = build_topdown_cumulative_frequency(
+            piece[["piece_id", "beat_idx"]],
+            component_map=component_map,
+            component_order=cumulative_components,
+            tolerance=int(cumulative_merge_tolerance),
+            component_weights=cumulative_component_weights,
+        )
+        piece = piece.merge(merged, on=["piece_id", "beat_idx"], how="left")
+        piece["frequency_target"] = piece["frequency_target"].fillna(0.0).astype(np.float32)
+    else:
+        piece = piece.rename(columns={"detector_binary": "frequency_target"})
     piece["union_target"] = (piece["frequency_target"] > 0.0).astype(np.float32)
     piece = piece.rename(
         columns={
@@ -254,11 +298,16 @@ def apply_rest_span_training_labels(
     source_col: str,
     source_threshold: float,
     tolerance_negative_weight: float,
+    min_train_frequency_target: float,
 ) -> pd.DataFrame:
     frame = piece_df.copy()
     frame["train_frequency_target"] = frame["frequency_target"].astype(np.float32)
     frame["train_union_target"] = frame["union_target"].astype(np.float32)
     frame["train_loss_factor"] = np.ones(len(frame), dtype=np.float32)
+    if float(min_train_frequency_target) > 0.0:
+        keep_mask = frame["train_frequency_target"].to_numpy(dtype=np.float32) >= float(min_train_frequency_target)
+        frame.loc[~keep_mask, "train_frequency_target"] = 0.0
+        frame.loc[~keep_mask, "train_union_target"] = 0.0
     if mode == "none" and float(tolerance_negative_weight) >= 1.0:
         return frame
 
@@ -455,6 +504,50 @@ def compute_detector_loss(
     return (per_token * token_weights).sum() / token_weights.sum().clamp(min=1.0)
 
 
+def primary_metric_value(metrics, metric_name: str) -> float:
+    if metric_name == "union_recall":
+        return float(metrics.union_recall)
+    if metric_name == "consensus_recall":
+        return float(metrics.consensus_recall)
+    return float(metrics.weighted_recall)
+
+
+def precision_metric_value(metrics, metric_name: str) -> float:
+    if metric_name == "frequency_weighted_precision":
+        return float(metrics.frequency_weighted_precision)
+    if metric_name == "consensus_precision":
+        return float(metrics.consensus_precision)
+    return float(metrics.union_precision)
+
+
+def resolve_precision_floors(args) -> dict[str, float]:
+    floors = {
+        "union_precision": 0.0,
+        "frequency_weighted_precision": 0.0,
+        "consensus_precision": 0.0,
+    }
+    floors[str(args.precision_metric)] = float(args.min_precision)
+    if args.min_union_precision_floor is not None:
+        floors["union_precision"] = max(floors["union_precision"], float(args.min_union_precision_floor))
+    if args.min_frequency_weighted_precision_floor is not None:
+        floors["frequency_weighted_precision"] = max(
+            floors["frequency_weighted_precision"], float(args.min_frequency_weighted_precision_floor)
+        )
+    if args.min_consensus_precision_floor is not None:
+        floors["consensus_precision"] = max(
+            floors["consensus_precision"], float(args.min_consensus_precision_floor)
+        )
+    return floors
+
+
+def precision_floors_met(metrics, floors: dict[str, float]) -> bool:
+    return (
+        metrics.union_precision >= float(floors["union_precision"])
+        and metrics.frequency_weighted_precision >= float(floors["frequency_weighted_precision"])
+        and metrics.consensus_precision >= float(floors["consensus_precision"])
+    )
+
+
 def train_one_epoch(
     model,
     loader,
@@ -463,6 +556,8 @@ def train_one_epoch(
     loss_fn,
     loss_type: str,
     grad_clip: float,
+    ema_state: dict[str, torch.Tensor] | None = None,
+    ema_decay: float = 0.0,
     log_interval: int = 0,
 ) -> float:
     model.train()
@@ -489,6 +584,8 @@ def train_one_epoch(
         if grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
+        if ema_state is not None:
+            update_ema_state(ema_state, model, decay=float(ema_decay))
 
         total_loss += float(loss.item()) * int(mask.sum().item())
         total_tokens += int(mask.sum().item())
@@ -496,6 +593,64 @@ def train_one_epoch(
             running_loss = total_loss / max(total_tokens, 1)
             print(f"  step {batch_idx}/{len(loader)} | running_loss {running_loss:.4f}")
     return total_loss / max(total_tokens, 1)
+
+
+def build_scheduler(
+    optimizer: torch.optim.Optimizer,
+    scheduler_type: str,
+    epochs: int,
+    factor: float,
+    patience: int,
+    min_lr: float,
+    eta_min: float,
+):
+    if scheduler_type == "none":
+        return None
+    if scheduler_type == "plateau":
+        return torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="max",
+            factor=float(factor),
+            patience=int(patience),
+            min_lr=float(min_lr),
+        )
+    if scheduler_type == "cosine":
+        return torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=max(int(epochs), 1),
+            eta_min=float(eta_min),
+        )
+    raise ValueError(f"Unsupported scheduler_type: {scheduler_type}")
+
+
+def snapshot_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
+    return {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
+
+
+def average_state_dicts(state_dicts: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
+    if not state_dicts:
+        raise ValueError("state_dicts must not be empty")
+    avg_state = {}
+    keys = state_dicts[0].keys()
+    for key in keys:
+        tensors = [sd[key].float() for sd in state_dicts]
+        avg = torch.stack(tensors, dim=0).mean(dim=0)
+        avg_state[key] = avg.to(dtype=state_dicts[0][key].dtype)
+    return avg_state
+
+
+def init_ema_state(model: nn.Module) -> dict[str, torch.Tensor]:
+    return snapshot_state_dict(model)
+
+
+def update_ema_state(ema_state: dict[str, torch.Tensor], model: nn.Module, decay: float) -> None:
+    model_state = model.state_dict()
+    for key, value in model_state.items():
+        detached = value.detach().cpu()
+        if not torch.is_floating_point(detached):
+            ema_state[key] = detached.clone()
+            continue
+        ema_state[key].mul_(float(decay)).add_(detached, alpha=float(1.0 - decay))
 
 
 @torch.no_grad()
@@ -617,6 +772,8 @@ def union_metrics_to_dict(metrics) -> dict:
     return {
         "threshold": metrics.threshold,
         "union_precision": metrics.union_precision,
+        "frequency_weighted_precision": metrics.frequency_weighted_precision,
+        "consensus_precision": metrics.consensus_precision,
         "union_recall": metrics.union_recall,
         "union_f1": metrics.union_f1,
         "weighted_recall": metrics.weighted_recall,
@@ -709,6 +866,15 @@ def main():
             "level4_boundary",
             "level5_boundary",
             "level6_boundary",
+            "level1plus_boundary",
+            "level2plus_boundary",
+            "level3plus_boundary",
+            "level4plus_boundary",
+            "level5plus_split56_boundary",
+            "level1plus_split56_boundary",
+            "level2plus_split56_boundary",
+            "level3plus_split56_boundary",
+            "level4plus_split56_boundary",
             "level34_boundary",
             "level56_boundary",
         ],
@@ -723,12 +889,21 @@ def main():
         choices=["weighted_recall", "union_recall", "consensus_recall"],
         default="weighted_recall",
     )
+    parser.add_argument(
+        "--precision_metric",
+        choices=["union_precision", "frequency_weighted_precision", "consensus_precision"],
+        default="union_precision",
+    )
+    parser.add_argument("--min_union_precision_floor", type=float, default=None)
+    parser.add_argument("--min_frequency_weighted_precision_floor", type=float, default=None)
+    parser.add_argument("--min_consensus_precision_floor", type=float, default=None)
     parser.add_argument("--loss_type", choices=["bce", "bce_freq_weighted", "huber", "mse"], default="bce")
     parser.add_argument("--rest_span_label_mode", choices=["none", "expand_max", "canonical_ignore"], default="none")
     parser.add_argument("--rest_span_min_len", type=int, default=2)
     parser.add_argument("--rest_span_source_col", default="xml_rest_duration_norm")
     parser.add_argument("--rest_span_source_threshold", type=float, default=1e-8)
     parser.add_argument("--rest_span_tolerance_negative_weight", type=float, default=1.0)
+    parser.add_argument("--min_train_frequency_target", type=float, default=0.0)
     parser.add_argument("--skip_stage_grading", action="store_true")
     parser.add_argument("--add_derived_highlevel_features", action="store_true")
     parser.add_argument("--derived_feature_include", nargs="*", default=None)
@@ -736,6 +911,15 @@ def main():
     parser.add_argument("--transformer_heads", type=int, default=None)
     parser.add_argument("--transformer_layers", type=int, default=None)
     parser.add_argument("--transformer_ff_dim", type=int, default=None)
+    parser.add_argument("--scheduler_type", choices=["none", "plateau", "cosine"], default=None)
+    parser.add_argument("--scheduler_factor", type=float, default=None)
+    parser.add_argument("--scheduler_patience", type=int, default=None)
+    parser.add_argument("--scheduler_min_lr", type=float, default=None)
+    parser.add_argument("--scheduler_eta_min", type=float, default=None)
+    parser.add_argument("--checkpoint_avg_last_k", type=int, default=0)
+    parser.add_argument("--ema_decay", type=float, default=0.0)
+    parser.add_argument("--cumulative_merge_tolerance", type=int, default=0)
+    parser.add_argument("--cumulative_component_weights_json", type=str, default=None)
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -750,6 +934,12 @@ def main():
         seq_cfg["transformer_ff_dim"] = int(args.transformer_ff_dim)
     eval_cfg = cfg.get("evaluation", {})
     data_cfg = cfg.get("data", {})
+    cumulative_component_weights = None
+    if args.cumulative_component_weights_json:
+        cumulative_component_weights = {
+            str(key): float(value)
+            for key, value in json.loads(str(args.cumulative_component_weights_json)).items()
+        }
 
     seed = int(args.seed if args.seed is not None else seq_cfg.get("seed", 42))
     set_seed(seed)
@@ -795,6 +985,8 @@ def main():
         target_mode=args.detector_target,
         peak_cfg=peak_cfg,
         beat_unit_fallback=beat_unit_fallback,
+        cumulative_merge_tolerance=int(args.cumulative_merge_tolerance),
+        cumulative_component_weights=cumulative_component_weights,
     )
     piece_df = apply_rest_span_training_labels(
         piece_df,
@@ -803,6 +995,7 @@ def main():
         source_col=str(args.rest_span_source_col),
         source_threshold=float(args.rest_span_source_threshold),
         tolerance_negative_weight=float(args.rest_span_tolerance_negative_weight),
+        min_train_frequency_target=float(args.min_train_frequency_target),
     )
 
     train_samples = piece_samples_from_frame(piece_df, feature_cols, split="train")
@@ -852,13 +1045,31 @@ def main():
     epochs = int(args.epochs or seq_cfg.get("epochs", 30))
     patience = int(args.early_stop_patience if args.early_stop_patience is not None else seq_cfg.get("early_stop_patience", 5))
     grad_clip = float(seq_cfg.get("grad_clip", 1.0))
+    scheduler_type = str(args.scheduler_type or seq_cfg.get("scheduler_type", "none"))
+    scheduler = build_scheduler(
+        optimizer=optimizer,
+        scheduler_type=scheduler_type,
+        epochs=epochs,
+        factor=float(args.scheduler_factor if args.scheduler_factor is not None else seq_cfg.get("scheduler_factor", 0.5)),
+        patience=int(args.scheduler_patience if args.scheduler_patience is not None else seq_cfg.get("scheduler_patience", 2)),
+        min_lr=float(args.scheduler_min_lr if args.scheduler_min_lr is not None else seq_cfg.get("scheduler_min_lr", 1e-5)),
+        eta_min=float(args.scheduler_eta_min if args.scheduler_eta_min is not None else seq_cfg.get("scheduler_eta_min", 1e-5)),
+    )
+    checkpoint_avg_last_k = max(int(args.checkpoint_avg_last_k), 0)
+    ema_decay = float(args.ema_decay)
+    use_ema = ema_decay > 0.0
+    ema_state = init_ema_state(model) if use_ema else None
+    ema_model = build_sequence_model(args.model, input_dim=len(feature_cols), cfg=cfg, output_dim=1).to(device) if use_ema else None
+    precision_floors = resolve_precision_floors(args)
 
     best_epoch = 0
     best_key = None
     best_metrics = None
     best_val_pred = None
+    best_validation_model = "raw"
     history = []
     bad_epochs = 0
+    recent_state_dicts: deque[tuple[int, dict[str, torch.Tensor]]] = deque(maxlen=checkpoint_avg_last_k or None)
 
     for epoch in range(1, epochs + 1):
         train_loss = train_one_epoch(
@@ -869,9 +1080,17 @@ def main():
             loss_fn=loss_fn,
             loss_type=args.loss_type,
             grad_clip=grad_clip,
+            ema_state=ema_state,
+            ema_decay=ema_decay,
             log_interval=max(int(args.log_interval), 0),
         )
-        val_pred = predict_detector(model, val_loader, device=device)
+        eval_model = model
+        validation_model_name = "raw"
+        if use_ema and ema_model is not None and ema_state is not None:
+            ema_model.load_state_dict(ema_state)
+            eval_model = ema_model
+            validation_model_name = "ema"
+        val_pred = predict_detector(eval_model, val_loader, device=device)
         sequence_scores, sequence_union, sequence_frequency = detector_sequence_maps(val_pred)
         metrics = search_union_frequency_threshold(
             sequence_scores=sequence_scores,
@@ -883,37 +1102,56 @@ def main():
             min_precision=float(args.min_precision),
             consensus_threshold=consensus_threshold,
             prominence=prominence,
+            primary_metric=str(args.selection_metric),
+            precision_metric=str(args.precision_metric),
+            min_union_precision=float(precision_floors["union_precision"]),
+            min_frequency_weighted_precision=float(precision_floors["frequency_weighted_precision"]),
+            min_consensus_precision=float(precision_floors["consensus_precision"]),
         )
-        precision_floor_met = metrics.union_precision >= float(args.min_precision)
+        selected_precision = precision_metric_value(metrics, str(args.precision_metric))
+        precision_floor_met = precision_floors_met(metrics, precision_floors)
+        primary_metric = primary_metric_value(metrics, str(args.selection_metric))
+
+        if checkpoint_avg_last_k > 0:
+            recent_state_dicts.append((epoch, snapshot_state_dict(eval_model)))
+
+        if scheduler is not None:
+            if scheduler_type == "plateau":
+                scheduler.step(primary_metric)
+            else:
+                scheduler.step()
+        current_lr = float(optimizer.param_groups[0]["lr"])
         history.append(
             {
                 "epoch": epoch,
                 "train_loss": train_loss,
                 "union_precision": metrics.union_precision,
+                "frequency_weighted_precision": metrics.frequency_weighted_precision,
+                "consensus_precision": metrics.consensus_precision,
                 "union_recall": metrics.union_recall,
                 "union_f1": metrics.union_f1,
                 "weighted_recall": metrics.weighted_recall,
                 "consensus_recall": metrics.consensus_recall,
                 "best_threshold": metrics.threshold,
                 "precision_floor_met": precision_floor_met,
+                "selected_precision_value": selected_precision,
+                "precision_floors": {key: float(value) for key, value in precision_floors.items()},
+                "validation_model": validation_model_name,
+                "lr": current_lr,
             }
         )
         print(
             f"Epoch {epoch}/{epochs} | train_loss {train_loss:.4f} | "
-            f"union_precision {metrics.union_precision:.4f} | weighted_recall {metrics.weighted_recall:.4f} | "
-            f"consensus_recall {metrics.consensus_recall:.4f} | threshold {metrics.threshold:.3f}"
+            f"{args.precision_metric} {selected_precision:.4f} | "
+            f"{args.selection_metric} {primary_metric:.4f} | "
+            f"union_precision {metrics.union_precision:.4f} | threshold {metrics.threshold:.3f} | "
+            f"val_model {validation_model_name} | lr {current_lr:.6f}"
         )
-
-        if args.selection_metric == "union_recall":
-            primary_metric = metrics.union_recall
-        elif args.selection_metric == "consensus_recall":
-            primary_metric = metrics.consensus_recall
-        else:
-            primary_metric = metrics.weighted_recall
 
         current_key = (
             float(precision_floor_met),
-            primary_metric if precision_floor_met else metrics.union_precision,
+            primary_metric if precision_floor_met else selected_precision,
+            selected_precision,
             metrics.union_precision,
             metrics.weighted_recall,
             metrics.consensus_recall,
@@ -925,10 +1163,11 @@ def main():
             best_epoch = epoch
             best_metrics = metrics
             best_val_pred = val_pred.copy()
+            best_validation_model = validation_model_name
             bad_epochs = 0
             torch.save(
                 {
-                    "model_state_dict": model.state_dict(),
+                    "model_state_dict": snapshot_state_dict(eval_model),
                     "model_type": args.model,
                     "feature_columns": feature_cols,
                     "mean": mean,
@@ -937,8 +1176,12 @@ def main():
                     "detector_target": args.detector_target,
                     "best_threshold": metrics.threshold,
                     "min_precision": args.min_precision,
+                    "precision_metric": args.precision_metric,
+                    "selection_metric": args.selection_metric,
                     "consensus_threshold": consensus_threshold,
                     "loss_type": args.loss_type,
+                    "validation_model": validation_model_name,
+                    "ema_decay": ema_decay,
                 },
                 out_root / "detector_best.pt",
             )
@@ -950,6 +1193,99 @@ def main():
 
     if best_metrics is None or best_val_pred is None:
         raise RuntimeError("Detector training did not produce validation metrics")
+
+    checkpoint_average_summary = None
+    if checkpoint_avg_last_k > 1 and len(recent_state_dicts) >= 2:
+        avg_epochs = [epoch_idx for epoch_idx, _ in recent_state_dicts]
+        avg_state_dict = average_state_dicts([state for _, state in recent_state_dicts])
+        averaged_model = build_sequence_model(args.model, input_dim=len(feature_cols), cfg=cfg, output_dim=1).to(device)
+        averaged_model.load_state_dict(avg_state_dict)
+        avg_val_pred = predict_detector(averaged_model, val_loader, device=device)
+        avg_sequence_scores, avg_sequence_union, avg_sequence_frequency = detector_sequence_maps(avg_val_pred)
+        avg_metrics = search_union_frequency_threshold(
+            sequence_scores=avg_sequence_scores,
+            sequence_union_labels=avg_sequence_union,
+            sequence_frequency_targets=avg_sequence_frequency,
+            thresholds=thresholds,
+            tolerance=tolerance,
+            min_distance=min_distance,
+            min_precision=float(args.min_precision),
+            consensus_threshold=consensus_threshold,
+            prominence=prominence,
+            primary_metric=str(args.selection_metric),
+            precision_metric=str(args.precision_metric),
+            min_union_precision=float(precision_floors["union_precision"]),
+            min_frequency_weighted_precision=float(precision_floors["frequency_weighted_precision"]),
+            min_consensus_precision=float(precision_floors["consensus_precision"]),
+        )
+        avg_selected_precision = precision_metric_value(avg_metrics, str(args.precision_metric))
+        avg_precision_floor_met = precision_floors_met(avg_metrics, precision_floors)
+        avg_primary_metric = primary_metric_value(avg_metrics, str(args.selection_metric))
+        avg_key = (
+            float(avg_precision_floor_met),
+            avg_primary_metric if avg_precision_floor_met else avg_selected_precision,
+            avg_selected_precision,
+            avg_metrics.union_precision,
+            avg_metrics.weighted_recall,
+            avg_metrics.consensus_recall,
+            avg_metrics.union_f1,
+            -float(avg_metrics.mean_offset or 1e9),
+        )
+        checkpoint_average_summary = {
+            "epochs": avg_epochs,
+            "union_metrics": union_metrics_to_dict(avg_metrics),
+            "precision_floor_met": bool(avg_precision_floor_met),
+            "selected": bool(avg_key > best_key),
+        }
+        torch.save(
+            {
+                "model_state_dict": avg_state_dict,
+                "model_type": args.model,
+                "feature_columns": feature_cols,
+                "mean": mean,
+                "std": std,
+                "averaged_epochs": avg_epochs,
+                "detector_target": args.detector_target,
+                "best_threshold": avg_metrics.threshold,
+                "min_precision": args.min_precision,
+                "consensus_threshold": consensus_threshold,
+                "loss_type": args.loss_type,
+                "scheduler_type": scheduler_type,
+                "checkpoint_avg_last_k": checkpoint_avg_last_k,
+                "precision_metric": args.precision_metric,
+                "selection_metric": args.selection_metric,
+                "ema_decay": ema_decay,
+            },
+            out_root / "detector_lastk_avg.pt",
+        )
+        if avg_key > best_key:
+            best_key = avg_key
+            best_epoch = int(avg_epochs[-1])
+            best_metrics = avg_metrics
+            best_val_pred = avg_val_pred.copy()
+            best_validation_model = "lastk_average"
+            torch.save(
+                {
+                    "model_state_dict": avg_state_dict,
+                    "model_type": args.model,
+                    "feature_columns": feature_cols,
+                    "mean": mean,
+                    "std": std,
+                    "best_epoch": best_epoch,
+                    "detector_target": args.detector_target,
+                    "best_threshold": avg_metrics.threshold,
+                    "min_precision": args.min_precision,
+                    "consensus_threshold": consensus_threshold,
+                    "loss_type": args.loss_type,
+                    "scheduler_type": scheduler_type,
+                    "checkpoint_avg_last_k": checkpoint_avg_last_k,
+                    "precision_metric": args.precision_metric,
+                    "selection_metric": args.selection_metric,
+                    "ema_decay": ema_decay,
+                    "selected_from_lastk_average": True,
+                },
+                out_root / "detector_best.pt",
+            )
 
     train_df = piece_df[piece_df["protocol_split"] == "train"].copy()
     val_df = piece_df[piece_df["protocol_split"] == "val"].copy()
@@ -1022,14 +1358,23 @@ def main():
         "hard_negative_weight": float(args.hard_negative_weight),
         "easy_negative_weight": float(args.easy_negative_weight),
         "selection_metric": str(args.selection_metric),
+        "precision_metric": str(args.precision_metric),
+        "precision_floors": {key: float(value) for key, value in precision_floors.items()},
         "loss_type": str(args.loss_type),
+        "scheduler_type": str(scheduler_type),
+        "checkpoint_avg_last_k": int(checkpoint_avg_last_k),
+        "ema_decay": float(ema_decay),
+        "cumulative_merge_tolerance": int(args.cumulative_merge_tolerance),
+        "cumulative_component_weights": cumulative_component_weights,
         "rest_span_label_mode": str(args.rest_span_label_mode),
         "rest_span_min_len": int(args.rest_span_min_len),
         "rest_span_source_col": str(args.rest_span_source_col),
         "rest_span_source_threshold": float(args.rest_span_source_threshold),
         "rest_span_tolerance_negative_weight": float(args.rest_span_tolerance_negative_weight),
+        "min_train_frequency_target": float(args.min_train_frequency_target),
         "skip_stage_grading": bool(args.skip_stage_grading),
-        "precision_floor_met": bool(best_metrics.union_precision >= float(args.min_precision)),
+        "precision_floor_met": bool(precision_floors_met(best_metrics, precision_floors)),
+        "best_validation_model": str(best_validation_model),
         "union_metrics": union_metrics_to_dict(best_metrics),
         "feature_columns": feature_cols,
         "grader_feature_columns": grader_feature_cols,
@@ -1040,6 +1385,8 @@ def main():
             "target": "dominant_stage",
             **oracle_stage_grading,
         }
+    if checkpoint_average_summary is not None:
+        summary["checkpoint_average"] = checkpoint_average_summary
     if class_event_metrics is not None:
         summary["end_to_end_stage"] = labeled_metrics_to_dict(class_event_metrics)
     (out_root / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")

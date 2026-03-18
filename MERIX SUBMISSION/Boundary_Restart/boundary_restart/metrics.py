@@ -42,6 +42,8 @@ class LabeledEventMetrics:
 class UnionFrequencyMetrics:
     threshold: float
     union_precision: float
+    frequency_weighted_precision: float
+    consensus_precision: float
     union_recall: float
     union_f1: float
     weighted_recall: float
@@ -53,6 +55,7 @@ class UnionFrequencyMetrics:
     true_consensus_events: int
     matched_weight: float
     total_weight: float
+    matched_pred_weight: float
 
 
 def extract_events(
@@ -353,8 +356,10 @@ def evaluate_union_frequency_sequences(
     total_true_consensus = 0
     total_match = 0
     total_consensus_match = 0
+    total_pred_consensus_match = 0
     matched_weight = 0.0
     total_weight = 0.0
+    matched_pred_weight = 0.0
     offsets: list[int] = []
 
     for sample_id, scores in sequence_scores.items():
@@ -374,11 +379,16 @@ def evaluate_union_frequency_sequences(
         total_true_consensus += int(true_consensus_events.size)
         total_match += len(union_matches)
         total_consensus_match += len(consensus_matches)
+        total_pred_consensus_match += len(consensus_matches)
         offsets.extend(offset for _, _, offset in union_matches)
-        matched_weight += float(sum(freq_targets[true_union_events[true_idx]] for _, true_idx, _ in union_matches))
+        sample_match_weight = float(sum(freq_targets[true_union_events[true_idx]] for _, true_idx, _ in union_matches))
+        matched_weight += sample_match_weight
+        matched_pred_weight += sample_match_weight
         total_weight += float(freq_targets[true_union_events].sum())
 
     union_precision = float(total_match / total_pred) if total_pred > 0 else 0.0
+    frequency_weighted_precision = float(matched_pred_weight / total_pred) if total_pred > 0 else 0.0
+    consensus_precision = float(total_pred_consensus_match / total_pred) if total_pred > 0 else 0.0
     union_recall = float(total_match / total_true_union) if total_true_union > 0 else 0.0
     denom = union_precision + union_recall
     union_f1 = float(2.0 * union_precision * union_recall / denom) if denom > 0 else 0.0
@@ -389,6 +399,8 @@ def evaluate_union_frequency_sequences(
     return UnionFrequencyMetrics(
         threshold=float(threshold),
         union_precision=union_precision,
+        frequency_weighted_precision=frequency_weighted_precision,
+        consensus_precision=consensus_precision,
         union_recall=union_recall,
         union_f1=union_f1,
         weighted_recall=weighted_recall,
@@ -400,6 +412,7 @@ def evaluate_union_frequency_sequences(
         true_consensus_events=int(total_true_consensus),
         matched_weight=float(matched_weight),
         total_weight=float(total_weight),
+        matched_pred_weight=float(matched_pred_weight),
     )
 
 
@@ -413,6 +426,11 @@ def search_union_frequency_threshold(
     min_precision: float,
     consensus_threshold: float = 0.5,
     prominence: float = 0.0,
+    primary_metric: str = "weighted_recall",
+    precision_metric: str = "union_precision",
+    min_union_precision: float | None = None,
+    min_frequency_weighted_precision: float | None = None,
+    min_consensus_precision: float | None = None,
 ) -> UnionFrequencyMetrics:
     best_meeting_floor = None
     best_fallback = None
@@ -427,26 +445,69 @@ def search_union_frequency_threshold(
             consensus_threshold=consensus_threshold,
             prominence=prominence,
         )
+        if primary_metric == "union_recall":
+            primary_value = metrics.union_recall
+        elif primary_metric == "consensus_recall":
+            primary_value = metrics.consensus_recall
+        else:
+            primary_value = metrics.weighted_recall
+
+        if precision_metric == "frequency_weighted_precision":
+            precision_value = metrics.frequency_weighted_precision
+            fallback_secondary = metrics.union_precision
+        elif precision_metric == "consensus_precision":
+            precision_value = metrics.consensus_precision
+            fallback_secondary = metrics.union_precision
+        else:
+            precision_value = metrics.union_precision
+            fallback_secondary = metrics.frequency_weighted_precision
+        required_union_precision = float(min_union_precision) if min_union_precision is not None else 0.0
+        required_frequency_weighted_precision = (
+            float(min_frequency_weighted_precision) if min_frequency_weighted_precision is not None else 0.0
+        )
+        required_consensus_precision = (
+            float(min_consensus_precision) if min_consensus_precision is not None else 0.0
+        )
+        floor_tuple = (
+            metrics.union_precision >= required_union_precision,
+            metrics.frequency_weighted_precision >= required_frequency_weighted_precision,
+            metrics.consensus_precision >= required_consensus_precision,
+        )
+        floor_count = int(sum(1 for flag in floor_tuple if flag))
         current_weighted_key = (
-            metrics.weighted_recall,
+            primary_value,
+            precision_value,
+            metrics.frequency_weighted_precision,
+            metrics.consensus_precision,
             metrics.union_precision,
             metrics.consensus_recall,
             -float(metrics.mean_offset or 1e9),
             -metrics.threshold,
         )
         current_precision_key = (
+            floor_count,
+            int(floor_tuple[0]),
+            int(floor_tuple[1]),
+            int(floor_tuple[2]),
+            precision_value,
+            primary_value,
+            fallback_secondary,
+            metrics.frequency_weighted_precision,
+            metrics.consensus_precision,
             metrics.union_precision,
-            metrics.weighted_recall,
             metrics.consensus_recall,
             -float(metrics.mean_offset or 1e9),
             -metrics.threshold,
         )
-        if metrics.union_precision >= min_precision:
+        if all(floor_tuple):
             if best_meeting_floor is None:
                 best_meeting_floor = metrics
             else:
                 best_key = (
-                    best_meeting_floor.weighted_recall,
+                    (best_meeting_floor.union_recall if primary_metric == "union_recall" else best_meeting_floor.consensus_recall if primary_metric == "consensus_recall" else best_meeting_floor.weighted_recall),
+                    (best_meeting_floor.frequency_weighted_precision if precision_metric == "frequency_weighted_precision" else best_meeting_floor.consensus_precision if precision_metric == "consensus_precision" else best_meeting_floor.union_precision),
+                    best_meeting_floor.frequency_weighted_precision,
+                    best_meeting_floor.consensus_precision,
                     best_meeting_floor.union_precision,
                     best_meeting_floor.consensus_recall,
                     -float(best_meeting_floor.mean_offset or 1e9),
@@ -458,8 +519,20 @@ def search_union_frequency_threshold(
             best_fallback = metrics
         else:
             best_key = (
+                int(
+                    (best_fallback.union_precision >= required_union_precision)
+                    + (best_fallback.frequency_weighted_precision >= required_frequency_weighted_precision)
+                    + (best_fallback.consensus_precision >= required_consensus_precision)
+                ),
+                int(best_fallback.union_precision >= required_union_precision),
+                int(best_fallback.frequency_weighted_precision >= required_frequency_weighted_precision),
+                int(best_fallback.consensus_precision >= required_consensus_precision),
+                (best_fallback.frequency_weighted_precision if precision_metric == "frequency_weighted_precision" else best_fallback.consensus_precision if precision_metric == "consensus_precision" else best_fallback.union_precision),
+                (best_fallback.union_recall if primary_metric == "union_recall" else best_fallback.consensus_recall if primary_metric == "consensus_recall" else best_fallback.weighted_recall),
+                (best_fallback.union_precision if precision_metric != "union_precision" else best_fallback.frequency_weighted_precision),
+                best_fallback.frequency_weighted_precision,
+                best_fallback.consensus_precision,
                 best_fallback.union_precision,
-                best_fallback.weighted_recall,
                 best_fallback.consensus_recall,
                 -float(best_fallback.mean_offset or 1e9),
                 -best_fallback.threshold,

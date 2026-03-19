@@ -35,6 +35,7 @@ def _find_project_root(start: Path) -> Path:
 
 PROJECT_ROOT = _find_project_root(Path(__file__).resolve().parent)
 SUPPORTED_PIECES = ["M06-1", "M06-2", "M06-3", "M17-1", "M30-1"]
+WEIGHTED_TOPDOWN_PIECES = ["M06-1", "M06-2", "M06-3"]
 SEED_ORDER = [42, 44]
 STRATEGY_ORDER = ["baseline", "consensus_guarded"]
 STRATEGY_LABELS = {
@@ -56,10 +57,22 @@ STRATEGY_GROUP_SPECS = {
     "L5": {"slug": "level5", "color": "#c2185b"},
     "L6": {"slug": "level6", "color": "#6d4c41"},
 }
+WEIGHTED_TOPDOWN_GROUP_SPECS = {
+    "L1+": {"slug": "level1plus_split56_boundary", "color": "#0a6cff"},
+    "L2+": {"slug": "level2plus_split56_boundary", "color": "#00a35c"},
+    "L3+": {"slug": "level3plus_split56_boundary", "color": "#ff8a00"},
+    "L4+": {"slug": "level4plus_split56_boundary", "color": "#7b1fa2"},
+    "L5+": {"slug": "level5plus_split56_boundary", "color": "#c2185b"},
+    "L6": {"slug": "level6_boundary", "color": "#6d4c41"},
+}
 
 
 def get_group_specs(view_mode: str) -> dict[str, dict[str, str]]:
-    return CLEAN_GROUP_SPECS if view_mode == "clean_outer_seeds" else STRATEGY_GROUP_SPECS
+    if view_mode == "clean_outer_seeds":
+        return CLEAN_GROUP_SPECS
+    if view_mode == "weighted_topdown_seed44":
+        return WEIGHTED_TOPDOWN_GROUP_SPECS
+    return STRATEGY_GROUP_SPECS
 
 
 def get_group_order(view_mode: str) -> list[str]:
@@ -83,6 +96,20 @@ def get_predicted_events_path(level_slug: str, seed: int) -> Path:
 
 def get_summary_path(level_slug: str, seed: int) -> Path:
     return PROJECT_ROOT / f"MERIX SUBMISSION/Boundary_Restart/reports/clean_outer_test/M06_outer_{level_slug}_seed{seed}/summary.json"
+
+
+def get_weighted_predicted_events_path(detector_target_slug: str, seed: int) -> Path:
+    return (
+        PROJECT_ROOT
+        / f"MERIX SUBMISSION/Boundary_Restart/outputs/local_runs/clean_outer_test/weighted_topdown_{detector_target_slug}_seed{seed}/predicted_events.csv.gz"
+    )
+
+
+def get_weighted_summary_path(detector_target_slug: str, seed: int) -> Path:
+    return (
+        PROJECT_ROOT
+        / f"MERIX SUBMISSION/Boundary_Restart/reports/clean_outer_test/weighted_topdown_{detector_target_slug}_seed{seed}/summary.json"
+    )
 
 
 def get_strategy_specs(group_label: str) -> dict[str, str]:
@@ -143,6 +170,29 @@ def load_group_events(piece_id: str, group_label: str, seed: int) -> pd.DataFram
 
 
 @CACHE_DATA(show_spinner=False)
+def load_weighted_group_events(piece_id: str, group_label: str, seed: int = 44) -> pd.DataFrame:
+    detector_target_slug = WEIGHTED_TOPDOWN_GROUP_SPECS[group_label]["slug"]
+    path = get_weighted_predicted_events_path(detector_target_slug, seed)
+    if not path.exists():
+        return pd.DataFrame(columns=["beat_idx", "detector_score"])
+    frame = pd.read_csv(path)
+    frame = frame[frame["piece_id"] == piece_id].copy()
+    keep_cols = [
+        col
+        for col in [
+            "beat_idx",
+            "detector_score",
+            "matched_union",
+            "frequency_target_at_beat",
+            "matched_true_beat_idx",
+            "match_offset",
+        ]
+        if col in frame.columns
+    ]
+    return frame[keep_cols].copy()
+
+
+@CACHE_DATA(show_spinner=False)
 def load_strategy_events(piece_id: str, group_label: str, variant: str, seed: int = 42) -> pd.DataFrame:
     path = get_strategy_predicted_events_path(piece_id, group_label, variant, seed=seed)
     if not path.exists():
@@ -167,6 +217,15 @@ def load_strategy_events(piece_id: str, group_label: str, variant: str, seed: in
 def load_group_summary(group_label: str, seed: int) -> dict:
     level_slug = CLEAN_GROUP_SPECS[group_label]["slug"]
     path = get_summary_path(level_slug, seed)
+    if not path.exists():
+        return {}
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+@CACHE_DATA(show_spinner=False)
+def load_weighted_group_summary(group_label: str, seed: int = 44) -> dict:
+    detector_target_slug = WEIGHTED_TOPDOWN_GROUP_SPECS[group_label]["slug"]
+    path = get_weighted_summary_path(detector_target_slug, seed)
     if not path.exists():
         return {}
     return json.loads(path.read_text(encoding="utf-8"))
@@ -289,6 +348,44 @@ def build_strategy_breakpoint_table(piece_id: str, selected_groups: list[str], v
     return pd.DataFrame(rows).sort_values(["measure", "beat_in_measure", "group", "beat_idx"]).reset_index(drop=True)
 
 
+def build_weighted_breakpoint_table(piece_id: str, selected_groups: list[str], seed: int = 44) -> pd.DataFrame:
+    beat_map = load_beat_map(piece_id)
+    rows: list[dict] = []
+    for group_label in selected_groups:
+        mapped = map_events_to_measures(load_weighted_group_events(piece_id, group_label, seed), beat_map)
+        for item in mapped:
+            rows.append(
+                {
+                    "group": group_label,
+                    "seed": seed,
+                    "beat_idx": item["beat_idx"],
+                    "measure": item["measure"],
+                    "beat_in_measure": item["beat_in_measure"],
+                    "detector_score": item["detector_score"],
+                    "matched_union": item["matched_union"],
+                    "frequency_target_at_beat": item["frequency_target_at_beat"],
+                    "matched_true_beat_idx": item["matched_true_beat_idx"],
+                    "match_offset": item["match_offset"],
+                }
+            )
+    if not rows:
+        return pd.DataFrame(
+            columns=[
+                "group",
+                "seed",
+                "beat_idx",
+                "measure",
+                "beat_in_measure",
+                "detector_score",
+                "matched_union",
+                "frequency_target_at_beat",
+                "matched_true_beat_idx",
+                "match_offset",
+            ]
+        )
+    return pd.DataFrame(rows).sort_values(["measure", "beat_in_measure", "group", "beat_idx"]).reset_index(drop=True)
+
+
 def build_summary_table(piece_id: str, selected_groups: list[str], seed: int, breakpoints: pd.DataFrame) -> pd.DataFrame:
     summary_rows = []
     for group_label in selected_groups:
@@ -341,6 +438,30 @@ def build_strategy_summary_table(
                 "weighted_recall": union_metrics.get("weighted_recall"),
                 "consensus_recall": union_metrics.get("consensus_recall"),
                 "best_epoch": summary.get("best_epoch"),
+            }
+        )
+    return pd.DataFrame(summary_rows)
+
+
+def build_weighted_summary_table(piece_id: str, selected_groups: list[str], breakpoints: pd.DataFrame, seed: int = 44) -> pd.DataFrame:
+    summary_rows = []
+    for group_label in selected_groups:
+        group_df = breakpoints[breakpoints["group"] == group_label].copy()
+        summary = load_weighted_group_summary(group_label, seed)
+        union_metrics = summary.get("union_metrics", {})
+        summary_rows.append(
+            {
+                "group": group_label,
+                "seed": seed,
+                "events": int(len(group_df)) if not group_df.empty else int(union_metrics.get("pred_events", 0)),
+                "measures": int(group_df["measure"].nunique()) if not group_df.empty else 0,
+                "threshold": summary.get("frozen_threshold", union_metrics.get("threshold")),
+                "precision": union_metrics.get("union_precision"),
+                "freq_precision": union_metrics.get("frequency_weighted_precision"),
+                "union_recall": union_metrics.get("union_recall"),
+                "weighted_recall": union_metrics.get("weighted_recall"),
+                "consensus_recall": union_metrics.get("consensus_recall"),
+                "frozen_epochs": summary.get("frozen_epochs"),
             }
         )
     return pd.DataFrame(summary_rows)
@@ -517,6 +638,27 @@ def render_strategy_panel(piece_id: str, selected_groups: list[str], variant: st
     st.dataframe(breakpoints, use_container_width=True, hide_index=True)
 
 
+def render_weighted_seed44_panel(piece_id: str, selected_groups: list[str]) -> None:
+    xml_path = get_xml_path(piece_id)
+    breakpoints = build_weighted_breakpoint_table(piece_id, selected_groups, seed=44)
+    summary_df = build_weighted_summary_table(piece_id, selected_groups, breakpoints, seed=44)
+
+    st.markdown("### Weighted Topdown Clean Outer Seed44")
+    if breakpoints.empty:
+        st.info("当前本地还没有这批 weighted-topdown seed44 的事件表，只显示摘要。")
+    else:
+        annotated_xml = build_annotated_musicxml(xml_path, breakpoints, selected_groups, WEIGHTED_TOPDOWN_GROUP_SPECS)
+        render_score(
+            annotated_xml,
+            group_counts={row["group"]: int(row["events"]) for _, row in summary_df.iterrows()},
+            group_specs=WEIGHTED_TOPDOWN_GROUP_SPECS,
+            height=980,
+        )
+
+    st.dataframe(summary_df, use_container_width=True, hide_index=True)
+    st.dataframe(breakpoints, use_container_width=True, hide_index=True)
+
+
 def main() -> None:
     if st is None:
         raise RuntimeError("streamlit is not installed; install it before running this app.")
@@ -524,13 +666,16 @@ def main() -> None:
     st.title("Mazurka Breakpoint Visualizer")
     view_mode = st.sidebar.radio(
         "展示模式",
-        options=["clean_outer_seeds", "strategy_compare"],
+        options=["weighted_topdown_seed44", "clean_outer_seeds", "strategy_compare"],
         format_func=lambda value: {
+            "weighted_topdown_seed44": "Weighted Topdown Seed44",
             "clean_outer_seeds": "Clean Outer Seed42 vs Seed44",
             "strategy_compare": "Baseline vs Consensus Guarded",
         }[value],
     )
-    if view_mode == "clean_outer_seeds":
+    if view_mode == "weighted_topdown_seed44":
+        st.caption("展示 weighted top-down wide-gap + TCN direct + train floor 0.05 的 clean outer seed44 六层结果。")
+    elif view_mode == "clean_outer_seeds":
         st.caption("展示 clean outer test 下的五层结果；每层分别显示 seed42 和 seed44。")
     else:
         st.caption("展示 5 首曲子、6 个 level 下的 baseline 与新策略对照；策略模式下高层拆成 L5 和 L6，并使用 union precision floor 0.7 的新结果。")
@@ -541,20 +686,24 @@ def main() -> None:
         st.warning("请至少选择一层。")
         return
 
-    tabs = st.tabs(SUPPORTED_PIECES)
-    for tab, piece_id in zip(tabs, SUPPORTED_PIECES):
+    pieces = WEIGHTED_TOPDOWN_PIECES if view_mode == "weighted_topdown_seed44" else SUPPORTED_PIECES
+    tabs = st.tabs(pieces)
+    for tab, piece_id in zip(tabs, pieces):
         with tab:
             st.subheader(piece_id)
             st.code(str(get_xml_path(piece_id)))
-            cols = st.columns(2)
-            if view_mode == "clean_outer_seeds":
-                for col, seed in zip(cols, SEED_ORDER):
-                    with col:
-                        render_seed_panel(piece_id, selected_groups, seed)
+            if view_mode == "weighted_topdown_seed44":
+                render_weighted_seed44_panel(piece_id, selected_groups)
             else:
-                for col, variant in zip(cols, STRATEGY_ORDER):
-                    with col:
-                        render_strategy_panel(piece_id, selected_groups, variant, seed=42)
+                cols = st.columns(2)
+                if view_mode == "clean_outer_seeds":
+                    for col, seed in zip(cols, SEED_ORDER):
+                        with col:
+                            render_seed_panel(piece_id, selected_groups, seed)
+                else:
+                    for col, variant in zip(cols, STRATEGY_ORDER):
+                        with col:
+                            render_strategy_panel(piece_id, selected_groups, variant, seed=42)
 
 
 if __name__ == "__main__":

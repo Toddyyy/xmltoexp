@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -32,14 +33,15 @@ from train_piece_union_protocol import (
 )
 
 
-OUTER_PIECES = ["M06-1", "M06-2", "M06-3"]
+OUTER_PIECES = os.environ.get("OUTER_PIECES", "M06-1 M06-2 M06-3").split()
 SEEDS = [42, 43, 44]
 TRAIN_FREQ_FLOOR = 0.05
 MIN_UNION_PRECISION = 0.70
 MAX_EPOCHS = 60
 EARLY_STOP_PATIENCE = 10
-DEVICE = "mps"
+DEVICE = os.environ.get("DEVICE", "mps")
 CANDIDATE_RADIUS = 1
+OUTPUT_TAG = os.environ.get("OUTPUT_TAG", "")
 
 TARGET_SPECS = {
     "L6": ("level6_boundary", 0),
@@ -244,8 +246,9 @@ def main() -> None:
     cfg = load_config(project_root / "configs/salience_grouped3_hi8_score_only_xml_curated.yaml")
     train_script = project_root / "train_piece_union_protocol.py"
     config_path = project_root / "configs/salience_grouped3_hi8_score_only_xml_curated.yaml"
-    run_root = project_root / "outputs/local_runs/l6_candidate_rerank_multiseed_t0p05_p70"
-    report_root = project_root / "reports/l6_candidate_rerank_multiseed_t0p05_p70"
+    suffix = f"_{OUTPUT_TAG}" if OUTPUT_TAG else ""
+    run_root = project_root / f"outputs/local_runs/l6_candidate_rerank_multiseed_t0p05_p70{suffix}"
+    report_root = project_root / f"reports/l6_candidate_rerank_multiseed_t0p05_p70{suffix}"
     run_root.mkdir(parents=True, exist_ok=True)
     report_root.mkdir(parents=True, exist_ok=True)
 

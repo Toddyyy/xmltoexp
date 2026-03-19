@@ -134,6 +134,7 @@ def main() -> None:
     )
     piece_df = apply_rest_span_training_labels(
         piece_df,
+        min_train_frequency_target=float(candidate.get("min_train_frequency_target", 0.0)),
         mode=str(candidate.get("rest_span_label_mode", "none")),
         min_len=int(candidate.get("rest_span_min_len", 2)),
         source_col=str(candidate.get("rest_span_source_col", "xml_rest_duration_norm")),

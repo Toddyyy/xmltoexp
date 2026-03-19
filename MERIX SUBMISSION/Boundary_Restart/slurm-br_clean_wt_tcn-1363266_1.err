@@ -1,0 +1,11 @@
+Traceback (most recent call last):
+  File "/gpfs/work/int/yuxuanliu2204/Changheng/xmltoexp/MERIX SUBMISSION/Boundary_Restart/run_clean_outer_test_from_nested.py", line 264, in <module>
+    main()
+    ~~~~^^
+  File "/gpfs/work/int/yuxuanliu2204/Changheng/xmltoexp/MERIX SUBMISSION/Boundary_Restart/run_clean_outer_test_from_nested.py", line 135, in main
+    piece_df = apply_rest_span_training_labels(
+        piece_df,
+    ...<4 lines>...
+        tolerance_negative_weight=float(candidate.get("rest_span_tolerance_negative_weight", 1.0)),
+    )
+TypeError: apply_rest_span_training_labels() missing 1 required positional argument: 'min_train_frequency_target'

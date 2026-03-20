@@ -65,6 +65,7 @@ WEIGHTED_TOPDOWN_GROUP_SPECS = {
     "L5+": {"slug": "level5plus_split56_boundary", "color": "#c2185b"},
     "L6": {"slug": "level6_boundary", "color": "#6d4c41"},
 }
+WEIGHTED_TOPDOWN_DISPLAY_PRIORITY = ["L6", "L5+", "L4+", "L3+", "L2+", "L1+"]
 
 
 def get_group_specs(view_mode: str) -> dict[str, dict[str, str]]:
@@ -386,6 +387,46 @@ def build_weighted_breakpoint_table(piece_id: str, selected_groups: list[str], s
     return pd.DataFrame(rows).sort_values(["measure", "beat_in_measure", "group", "beat_idx"]).reset_index(drop=True)
 
 
+def suppress_lower_breakpoints_within_tolerance(
+    breakpoints: pd.DataFrame,
+    *,
+    priority_order: list[str],
+    tolerance: int = 1,
+) -> pd.DataFrame:
+    if breakpoints.empty:
+        return breakpoints
+
+    priority_rank = {group: idx for idx, group in enumerate(priority_order)}
+    kept_beats: list[int] = []
+    kept_rows = []
+
+    ordered = breakpoints.copy()
+    ordered["priority_rank"] = ordered["group"].map(lambda value: priority_rank.get(value, len(priority_rank)))
+    ordered = ordered.sort_values(["priority_rank", "beat_idx", "detector_score"], ascending=[True, True, False])
+
+    for row in ordered.itertuples(index=False):
+        beat_idx = int(row.beat_idx)
+        if any(abs(beat_idx - existing) <= tolerance for existing in kept_beats):
+            continue
+        kept_beats.append(beat_idx)
+        kept_rows.append(
+            {
+                "group": row.group,
+                "seed": row.seed,
+                "beat_idx": beat_idx,
+                "measure": row.measure,
+                "beat_in_measure": row.beat_in_measure,
+                "detector_score": row.detector_score,
+                "matched_union": row.matched_union,
+                "frequency_target_at_beat": row.frequency_target_at_beat,
+                "matched_true_beat_idx": row.matched_true_beat_idx,
+                "match_offset": row.match_offset,
+            }
+        )
+
+    return pd.DataFrame(kept_rows).sort_values(["measure", "beat_in_measure", "group", "beat_idx"]).reset_index(drop=True)
+
+
 def build_summary_table(piece_id: str, selected_groups: list[str], seed: int, breakpoints: pd.DataFrame) -> pd.DataFrame:
     summary_rows = []
     for group_label in selected_groups:
@@ -640,10 +681,16 @@ def render_strategy_panel(piece_id: str, selected_groups: list[str], variant: st
 
 def render_weighted_seed44_panel(piece_id: str, selected_groups: list[str]) -> None:
     xml_path = get_xml_path(piece_id)
-    breakpoints = build_weighted_breakpoint_table(piece_id, selected_groups, seed=44)
+    raw_breakpoints = build_weighted_breakpoint_table(piece_id, selected_groups, seed=44)
+    breakpoints = suppress_lower_breakpoints_within_tolerance(
+        raw_breakpoints,
+        priority_order=[group for group in WEIGHTED_TOPDOWN_DISPLAY_PRIORITY if group in selected_groups],
+        tolerance=1,
+    )
     summary_df = build_weighted_summary_table(piece_id, selected_groups, breakpoints, seed=44)
 
     st.markdown("### Weighted Topdown Clean Outer Seed44")
+    st.caption("显示规则：高层优先；若更低层断点落在更高层断点的 ±1 beat 内，则在谱面和事件表中隐藏。")
     if breakpoints.empty:
         st.info("当前本地还没有这批 weighted-topdown seed44 的事件表，只显示摘要。")
     else:

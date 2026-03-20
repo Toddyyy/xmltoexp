@@ -5,8 +5,8 @@
 #SBATCH --time=72:00:00
 #SBATCH --mem=32G
 #SBATCH --cpus-per-task=8
-#SBATCH --partition=gpua800
-#SBATCH --qos=1a800
+#SBATCH --partition=gpu3090
+#SBATCH --qos=1gpu
 #SBATCH --gres=gpu:1
 #SBATCH --array=0-2
 

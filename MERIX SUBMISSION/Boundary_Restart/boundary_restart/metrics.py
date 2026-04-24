@@ -416,6 +416,80 @@ def evaluate_union_frequency_sequences(
     )
 
 
+def evaluate_union_frequency_event_sets(
+    sequence_pred_events: dict[str, np.ndarray],
+    sequence_union_labels: dict[str, np.ndarray],
+    sequence_frequency_targets: dict[str, np.ndarray],
+    tolerance: int,
+    threshold: float = 0.5,
+    consensus_threshold: float = 0.5,
+) -> UnionFrequencyMetrics:
+    total_pred = 0
+    total_true_union = 0
+    total_true_consensus = 0
+    total_match = 0
+    total_consensus_match = 0
+    total_pred_consensus_match = 0
+    matched_weight = 0.0
+    total_weight = 0.0
+    matched_pred_weight = 0.0
+    offsets: list[int] = []
+
+    for sample_id, pred_events in sequence_pred_events.items():
+        pred_events = np.asarray(pred_events, dtype=np.int32)
+        union_labels = np.asarray(sequence_union_labels[sample_id], dtype=np.float32)
+        freq_targets = np.asarray(sequence_frequency_targets[sample_id], dtype=np.float32)
+
+        pred_events = pred_events[(pred_events >= 0) & (pred_events < union_labels.shape[0])]
+        pred_events = np.asarray(sorted(set(pred_events.tolist())), dtype=np.int32)
+        true_union_events = np.flatnonzero(union_labels > 0.5).astype(np.int32)
+        true_consensus_events = np.flatnonzero(freq_targets >= float(consensus_threshold)).astype(np.int32)
+
+        union_matches = greedy_match_pairs(pred_events, true_union_events, tolerance=tolerance)
+        consensus_matches = greedy_match_pairs(pred_events, true_consensus_events, tolerance=tolerance)
+
+        total_pred += int(pred_events.size)
+        total_true_union += int(true_union_events.size)
+        total_true_consensus += int(true_consensus_events.size)
+        total_match += len(union_matches)
+        total_consensus_match += len(consensus_matches)
+        total_pred_consensus_match += len(consensus_matches)
+        offsets.extend(offset for _, _, offset in union_matches)
+        sample_match_weight = float(sum(freq_targets[true_union_events[true_idx]] for _, true_idx, _ in union_matches))
+        matched_weight += sample_match_weight
+        matched_pred_weight += sample_match_weight
+        total_weight += float(freq_targets[true_union_events].sum())
+
+    union_precision = float(total_match / total_pred) if total_pred > 0 else 0.0
+    frequency_weighted_precision = float(matched_pred_weight / total_pred) if total_pred > 0 else 0.0
+    consensus_precision = float(total_pred_consensus_match / total_pred) if total_pred > 0 else 0.0
+    union_recall = float(total_match / total_true_union) if total_true_union > 0 else 0.0
+    denom = union_precision + union_recall
+    union_f1 = float(2.0 * union_precision * union_recall / denom) if denom > 0 else 0.0
+    weighted_recall = float(matched_weight / total_weight) if total_weight > 0 else 0.0
+    consensus_recall = float(total_consensus_match / total_true_consensus) if total_true_consensus > 0 else 0.0
+    mean_offset = float(np.mean(np.abs(offsets))) if offsets else None
+
+    return UnionFrequencyMetrics(
+        threshold=float(threshold),
+        union_precision=union_precision,
+        frequency_weighted_precision=frequency_weighted_precision,
+        consensus_precision=consensus_precision,
+        union_recall=union_recall,
+        union_f1=union_f1,
+        weighted_recall=weighted_recall,
+        consensus_recall=consensus_recall,
+        mean_offset=mean_offset,
+        matches=int(total_match),
+        pred_events=int(total_pred),
+        true_union_events=int(total_true_union),
+        true_consensus_events=int(total_true_consensus),
+        matched_weight=float(matched_weight),
+        total_weight=float(total_weight),
+        matched_pred_weight=float(matched_pred_weight),
+    )
+
+
 def search_union_frequency_threshold(
     sequence_scores: dict[str, np.ndarray],
     sequence_union_labels: dict[str, np.ndarray],

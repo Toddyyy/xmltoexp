@@ -1,0 +1,23 @@
+Traceback (most recent call last):
+  File "/gpfs/work/int/yuxuanliu2204/Changheng/xmltoexp/MERIX SUBMISSION/Boundary_Restart/run_nested_piece_cv.py", line 396, in <module>
+    main()
+    ~~~~^^
+  File "/gpfs/work/int/yuxuanliu2204/Changheng/xmltoexp/MERIX SUBMISSION/Boundary_Restart/run_nested_piece_cv.py", line 293, in main
+    summary = run_protocol(
+        python_exec=str(args.python_exec),
+    ...<6 lines>...
+        reuse_existing=bool(args.reuse_existing),
+    )
+  File "/gpfs/work/int/yuxuanliu2204/Changheng/xmltoexp/MERIX SUBMISSION/Boundary_Restart/run_nested_piece_cv.py", line 152, in run_protocol
+    return json.loads(summary_path.read_text(encoding="utf-8"))
+           ~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/gpfs/work/int/yuxuanliu2204/miniconda3/lib/python3.13/json/__init__.py", line 346, in loads
+    return _default_decoder.decode(s)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^
+  File "/gpfs/work/int/yuxuanliu2204/miniconda3/lib/python3.13/json/decoder.py", line 345, in decode
+    obj, end = self.raw_decode(s, idx=_w(s, 0).end())
+               ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "/gpfs/work/int/yuxuanliu2204/miniconda3/lib/python3.13/json/decoder.py", line 361, in raw_decode
+    obj, end = self.scan_once(s, idx)
+               ~~~~~~~~~~~~~~^^^^^^^^
+json.decoder.JSONDecodeError: Expecting property name enclosed in double quotes: line 2 column 1 (char 2)

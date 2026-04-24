@@ -1,0 +1,59 @@
+{
+  "seed": 44,
+  "outer_pieces": [
+    "M06-1",
+    "M06-2",
+    "M06-3"
+  ],
+  "train_piece_count": 41,
+  "train_floor": 0.05,
+  "merge_tolerance": 2,
+  "component_weights": {
+    "level56": 1.0,
+    "level4": 0.64,
+    "level3": 0.46,
+    "level2": 0.28,
+    "level1": 0.16
+  },
+  "standardization": "per-performer mean-centering of tempo curves",
+  "prediction_selection": "use clean outer predicted_events directly",
+  "beta": [
+    -38.81392388259294,
+    -6.380407578885205,
+    -9.747693256980948,
+    -14.387228016452193,
+    -12.555520909063327,
+    -18.321328708391878
+  ],
+  "summary": [
+    {
+      "piece_id": "M06-1",
+      "true_rmse": 20.301438342081934,
+      "true_corr": 0.6564214711888385,
+      "pred_rmse": 24.005636428075075,
+      "pred_corr": 0.5489447407532111,
+      "raw_piece_mean_tempo": 128.60437490526064,
+      "mean_performer_mean_tempo": 128.60437490526067
+    },
+    {
+      "piece_id": "M06-2",
+      "true_rmse": 16.61317185073122,
+      "true_corr": 0.7464753205523234,
+      "pred_rmse": 22.016136016941704,
+      "pred_corr": 0.5555670802543986,
+      "raw_piece_mean_tempo": 132.1083520955719,
+      "mean_performer_mean_tempo": 132.10835209557186
+    },
+    {
+      "piece_id": "M06-3",
+      "true_rmse": 15.496044192257333,
+      "true_corr": 0.6377644379478644,
+      "pred_rmse": 19.338451743534257,
+      "pred_corr": 0.4692716067707096,
+      "raw_piece_mean_tempo": 177.19170841845076,
+      "mean_performer_mean_tempo": 177.19170841845076
+    }
+  ],
+  "pdf_path": "/Users/toddywang/Documents/VsCodeProjects/xmltoexp/MERIX SUBMISSION/Boundary_Restart/outputs/local_runs/clean_outer_reconstruction_merge56_seed44_centered_predcount/clean_outer_merge56_centered_reconstruction_seed44.pdf",
+  "pred_vs_all_true_pdf_path": "/Users/toddywang/Documents/VsCodeProjects/xmltoexp/MERIX SUBMISSION/Boundary_Restart/outputs/local_runs/clean_outer_reconstruction_merge56_seed44_centered_predcount/clean_outer_merge56_centered_pred_vs_all_true_tempo_seed44.pdf"
+}

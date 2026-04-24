@@ -1,0 +1,41 @@
+{
+  "model": "lbdm",
+  "target_mode": "level1plus_boundary",
+  "level_label": "L1+",
+  "target_design": "weighted_topdown",
+  "feature_family": "all",
+  "outer_heldout_pieces": [
+    "M06-1",
+    "M06-2",
+    "M06-3"
+  ],
+  "seed": 44,
+  "min_train_frequency_target": 0.05,
+  "selection_metric": "weighted_recall",
+  "precision_metric": "union_precision",
+  "min_precision": 0.85,
+  "fixed_threshold": 0.3310975616843235,
+  "feature_columns": [
+    "lbdm_score"
+  ],
+  "train_piece_count": 41,
+  "outer_piece_count": 3,
+  "inner_fold_count": 41,
+  "union_metrics": {
+    "threshold": 0.3310975730419159,
+    "union_precision": 0.7962962962962963,
+    "frequency_weighted_precision": 0.09670220179638515,
+    "consensus_precision": 0.009259259259259259,
+    "union_recall": 0.26461538461538464,
+    "union_f1": 0.3972286374133949,
+    "weighted_recall": 0.36044741372060823,
+    "consensus_recall": 0.2,
+    "mean_offset": 0.3953488372093023,
+    "matches": 86,
+    "pred_events": 108,
+    "true_union_events": 325,
+    "true_consensus_events": 5,
+    "matched_weight": 10.443837794009596,
+    "total_weight": 28.974650382995605
+  }
+}

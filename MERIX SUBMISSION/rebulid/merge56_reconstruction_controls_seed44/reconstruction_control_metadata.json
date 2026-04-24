@@ -1,0 +1,72 @@
+{
+  "source_metadata": {
+    "seed": 44,
+    "outer_pieces": [
+      "M06-1",
+      "M06-2",
+      "M06-3"
+    ],
+    "train_piece_count": 41,
+    "train_floor": 0.05,
+    "merge_tolerance": 2,
+    "component_weights": {
+      "level56": 1.0,
+      "level4": 0.64,
+      "level3": 0.46,
+      "level2": 0.28,
+      "level1": 0.16
+    },
+    "standardization": "per-performer z-score ((tempo - mean) / std)",
+    "prediction_selection": "use clean outer predicted_events directly",
+    "beta": [
+      -1.1459351185767561,
+      -0.2037003187787162,
+      -0.28498056542164296,
+      -0.42305972566816347,
+      -0.37330949786888246,
+      -0.5281638507848945
+    ],
+    "summary": [
+      {
+        "piece_id": "M06-1",
+        "true_rmse": 0.6579881976276459,
+        "true_corr": 0.6553244447261781,
+        "pred_rmse": 0.7687645963617377,
+        "pred_corr": 0.5459653113322169,
+        "raw_piece_mean_tempo": 128.60437490526064,
+        "mean_performer_mean_tempo": 128.60437490526067,
+        "mean_performer_std_tempo": 31.202258799920354,
+        "num_performers": 34.0
+      },
+      {
+        "piece_id": "M06-2",
+        "true_rmse": 0.5740787803218079,
+        "true_corr": 0.7450706845627116,
+        "pred_rmse": 0.738492117917519,
+        "pred_corr": 0.5521939036622506,
+        "raw_piece_mean_tempo": 132.1083520955719,
+        "mean_performer_mean_tempo": 132.10835209557186,
+        "mean_performer_std_tempo": 29.57434366988976,
+        "num_performers": 42.0
+      },
+      {
+        "piece_id": "M06-3",
+        "true_rmse": 0.4948130548911442,
+        "true_corr": 0.645656301302147,
+        "pred_rmse": 0.6294514638106192,
+        "pred_corr": 0.46028357320467156,
+        "raw_piece_mean_tempo": 177.19170841845076,
+        "mean_performer_mean_tempo": 177.19170841845076,
+        "mean_performer_std_tempo": 33.80558549340918,
+        "num_performers": 42.0
+      }
+    ],
+    "pdf_path": "/Users/toddywang/Documents/VsCodeProjects/xmltoexp/MERIX SUBMISSION/Boundary_Restart/outputs/local_runs/clean_outer_reconstruction_merge56_seed44_per_performer_zscore_predcount/clean_outer_merge56_per_performer_zscore_reconstruction_seed44.pdf",
+    "pred_vs_all_true_pdf_path": "/Users/toddywang/Documents/VsCodeProjects/xmltoexp/MERIX SUBMISSION/Boundary_Restart/outputs/local_runs/clean_outer_reconstruction_merge56_seed44_per_performer_zscore_predcount/clean_outer_merge56_per_performer_zscore_pred_vs_all_true_tempo_seed44.pdf"
+  },
+  "barline_beta": [
+    -0.019044380476485014,
+    -0.0323140024145514
+  ],
+  "output_dir": "/Users/toddywang/Documents/VsCodeProjects/xmltoexp/MERIX SUBMISSION/rebulid/merge56_reconstruction_controls_seed44"
+}

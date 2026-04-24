@@ -519,3 +519,17 @@ def extract_xml_beat_features(
         beat_unit=float(beat_unit),
         expand_repeats=bool(expand_repeats),
     ).copy()
+
+
+def extract_xml_beat_features_from_path(
+    xml_path: Path,
+    num_beats: int,
+    beat_unit: float = 1.0,
+    expand_repeats: bool = True,
+) -> pd.DataFrame:
+    return _extract_xml_beat_features_cached(
+        xml_path_str=str(Path(xml_path).resolve()),
+        num_beats=int(num_beats),
+        beat_unit=float(beat_unit),
+        expand_repeats=bool(expand_repeats),
+    ).copy()

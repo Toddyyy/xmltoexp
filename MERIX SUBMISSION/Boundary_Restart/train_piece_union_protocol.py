@@ -844,7 +844,7 @@ def main():
     parser.add_argument("--config", required=True)
     parser.add_argument("--heldout_piece", nargs="+", required=True)
     parser.add_argument("--train_pieces", nargs="*", default=None)
-    parser.add_argument("--model", choices=["bilstm", "tcn", "transformer"], default="tcn")
+    parser.add_argument("--model", choices=["bilstm", "tcn", "cnn", "transformer"], default="tcn")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--batch_size", type=int, default=None)

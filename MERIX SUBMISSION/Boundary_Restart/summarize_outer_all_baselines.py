@@ -28,7 +28,7 @@ SETTING_ORDER = {
     "periodic_k_direct": 7,
     "downbeat_only_direct": 8,
     "logreg_window7_weighted_all": 9,
-    "bilstm_weighted_all": 10,
+    "cnn_weighted_all": 10,
     "grouper_weighted_all": 11,
 }
 
@@ -61,7 +61,7 @@ def parse_args() -> argparse.Namespace:
         default="paper_outer_baselines_weighted_topdown_all_seed{seed}_lbdm_only",
     )
     parser.add_argument("--nonseq_dir_template", default="paper_outer_missing_baselines_seed{seed}")
-    parser.add_argument("--bilstm_dir_template", default="paper_outer_baselines_weighted_topdown_all_seed{seed}_bilstm")
+    parser.add_argument("--cnn_dir_template", default="paper_outer_baselines_weighted_topdown_all_seed{seed}_cnn1d")
     parser.add_argument("--grouper_levelwise_csv", default=None)
     parser.add_argument("--output_prefix", default=None)
     return parser.parse_args()
@@ -81,8 +81,8 @@ def first_non_null(series: pd.Series):
 def map_setting(model: str, target_design: str, feature_family: str) -> str:
     model = str(model)
     design_slug = "weighted" if str(target_design) == "weighted_topdown" else str(target_design)
-    if model == "bilstm":
-        return "bilstm_weighted_all"
+    if model == "cnn":
+        return "cnn_weighted_all"
     if model == "all_boundary":
         return "all_boundary_direct"
     if model == "periodic":
@@ -190,7 +190,7 @@ def main() -> None:
         "logreg_weighted_xml_only": [],
         "lbdm_weighted_all": [],
         "nonseq": [],
-        "bilstm": [],
+        "cnn": [],
     }
     missing_paths: list[str] = []
 
@@ -225,13 +225,13 @@ def main() -> None:
         else:
             missing_paths.append(str(nonseq_dir / "outer_summary_by_level.csv"))
 
-        bilstm_dir = report_root / args.bilstm_dir_template.format(seed=seed)
-        bilstm_rows = load_outer_summary_csv(bilstm_dir, seed=seed)
-        if bilstm_rows:
-            raw_rows.extend(bilstm_rows)
-            source_dirs["bilstm"].append(str(bilstm_dir))
+        cnn_dir = report_root / args.cnn_dir_template.format(seed=seed)
+        cnn_rows = load_outer_summary_csv(cnn_dir, seed=seed)
+        if cnn_rows:
+            raw_rows.extend(cnn_rows)
+            source_dirs["cnn"].append(str(cnn_dir))
         else:
-            missing_paths.append(str(bilstm_dir / "outer_summary_by_level.csv"))
+            missing_paths.append(str(cnn_dir / "outer_summary_by_level.csv"))
 
     grouper_rows, grouper_status = load_grouper_rows(args.grouper_levelwise_csv)
     raw_rows.extend(grouper_rows)

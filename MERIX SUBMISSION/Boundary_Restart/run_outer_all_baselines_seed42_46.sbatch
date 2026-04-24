@@ -33,7 +33,7 @@ REUSE_EXISTING="${REUSE_EXISTING:-1}"
 RUN_TCN="${RUN_TCN:-1}"
 RUN_RETAINED_BASELINES="${RUN_RETAINED_BASELINES:-1}"
 RUN_NEW_BASELINES="${RUN_NEW_BASELINES:-1}"
-RUN_BILSTM="${RUN_BILSTM:-1}"
+RUN_CNN="${RUN_CNN:-1}"
 RUN_SUMMARY="${RUN_SUMMARY:-1}"
 
 DEVICE="${DEVICE:-cuda}"
@@ -45,10 +45,10 @@ CUMULATIVE_MERGE_TOLERANCE="${CUMULATIVE_MERGE_TOLERANCE:-2}"
 WEIGHTS_JSON_DEFAULT='{"level56":1.0,"level4":0.64,"level3":0.46,"level2":0.28,"level1":0.16}'
 CUMULATIVE_COMPONENT_WEIGHTS_JSON="${CUMULATIVE_COMPONENT_WEIGHTS_JSON:-$WEIGHTS_JSON_DEFAULT}"
 
-BILSTM_DEVICE="${BILSTM_DEVICE:-$DEVICE}"
-BILSTM_BATCH_SIZE="${BILSTM_BATCH_SIZE:-128}"
-BILSTM_EPOCHS="${BILSTM_EPOCHS:-60}"
-BILSTM_EARLY_STOP_PATIENCE="${BILSTM_EARLY_STOP_PATIENCE:-10}"
+CNN_DEVICE="${CNN_DEVICE:-$DEVICE}"
+CNN_BATCH_SIZE="${CNN_BATCH_SIZE:-128}"
+CNN_EPOCHS="${CNN_EPOCHS:-60}"
+CNN_EARLY_STOP_PATIENCE="${CNN_EARLY_STOP_PATIENCE:-10}"
 
 GROUPER_LEVELWISE_CSV="${GROUPER_LEVELWISE_CSV:-}"
 SUMMARY_OUTPUT_PREFIX="${SUMMARY_OUTPUT_PREFIX:-paper_outer_all_baseline_summary_seed${SEED_SLUG}}"
@@ -71,7 +71,7 @@ echo "REUSE_EXISTING=$REUSE_EXISTING"
 echo "RUN_TCN=$RUN_TCN"
 echo "RUN_RETAINED_BASELINES=$RUN_RETAINED_BASELINES"
 echo "RUN_NEW_BASELINES=$RUN_NEW_BASELINES"
-echo "RUN_BILSTM=$RUN_BILSTM"
+echo "RUN_CNN=$RUN_CNN"
 echo "RUN_SUMMARY=$RUN_SUMMARY"
 
 run_tcn_seed() {
@@ -146,18 +146,18 @@ run_score_baseline() {
   "${cmd[@]}"
 }
 
-run_bilstm_seed() {
+run_cnn_seed() {
   local seed="$1"
-  local output_dir="reports/paper_outer_baselines_weighted_topdown_all_seed${seed}_bilstm"
+  local output_dir="reports/paper_outer_baselines_weighted_topdown_all_seed${seed}_cnn1d"
   local -a cmd=(
-    python run_outer_bilstm_baseline.py
+    python run_outer_cnn_baseline.py
     --config "$CONFIG"
     --outer_heldout_piece "${OUTER_HELDOUT[@]}"
     --seed "$seed"
-    --device "$BILSTM_DEVICE"
-    --batch_size "$BILSTM_BATCH_SIZE"
-    --epochs "$BILSTM_EPOCHS"
-    --early_stop_patience "$BILSTM_EARLY_STOP_PATIENCE"
+    --device "$CNN_DEVICE"
+    --batch_size "$CNN_BATCH_SIZE"
+    --epochs "$CNN_EPOCHS"
+    --early_stop_patience "$CNN_EARLY_STOP_PATIENCE"
     --output_dir "$output_dir"
   )
   if [ -n "$MAX_INNER_FOLDS" ]; then
@@ -225,8 +225,8 @@ for SEED in "${SEEDS[@]}"; do
       all_boundary periodic downbeat logreg_window7
   fi
 
-  if [ "$RUN_BILSTM" = "1" ]; then
-    run_bilstm_seed "$SEED"
+  if [ "$RUN_CNN" = "1" ]; then
+    run_cnn_seed "$SEED"
   fi
 done
 

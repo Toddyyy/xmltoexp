@@ -106,6 +106,39 @@ class TCNTagger(nn.Module):
         return x.squeeze(1) if x.size(1) == 1 else x.transpose(1, 2)
 
 
+class CNNTagger(nn.Module):
+    def __init__(
+        self,
+        input_dim: int,
+        channels: list[int],
+        kernel_size: int = 3,
+        dropout: float = 0.2,
+        output_dim: int = 1,
+    ):
+        super().__init__()
+        blocks = []
+        in_channels = input_dim
+        for out_channels in channels:
+            blocks.append(
+                TemporalBlock(
+                    in_channels=in_channels,
+                    out_channels=out_channels,
+                    kernel_size=kernel_size,
+                    dilation=1,
+                    dropout=dropout,
+                )
+            )
+            in_channels = out_channels
+        self.network = nn.Sequential(*blocks)
+        self.head = nn.Conv1d(in_channels, output_dim, 1)
+
+    def forward(self, x: torch.Tensor, lengths: torch.Tensor | None = None) -> torch.Tensor:
+        x = x.transpose(1, 2)
+        x = self.network(x)
+        x = self.head(x)
+        return x.squeeze(1) if x.size(1) == 1 else x.transpose(1, 2)
+
+
 class SinusoidalPositionalEncoding(nn.Module):
     def __init__(self, dim: int, max_len: int = 4096):
         super().__init__()
@@ -177,6 +210,15 @@ def build_sequence_model(model_type: str, input_dim: int, cfg: dict, output_dim:
     if model_type == "tcn":
         channels = [int(v) for v in seq_cfg.get("tcn_channels", [64, 64, 64])]
         return TCNTagger(
+            input_dim=input_dim,
+            channels=channels,
+            kernel_size=int(seq_cfg.get("kernel_size", 3)),
+            dropout=float(seq_cfg.get("dropout", 0.2)),
+            output_dim=output_dim,
+        )
+    if model_type == "cnn":
+        channels = [int(v) for v in seq_cfg.get("tcn_channels", [64, 64, 64])]
+        return CNNTagger(
             input_dim=input_dim,
             channels=channels,
             kernel_size=int(seq_cfg.get("kernel_size", 3)),

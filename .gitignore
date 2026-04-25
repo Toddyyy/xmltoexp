@@ -13,7 +13,14 @@ MERIX SUBMISSION/MIREX_Model/beat_data_smoke/
 MERIX SUBMISSION/MIREX_Model/check
 
 # Boundary_Restart generated artifacts
-MERIX SUBMISSION/Boundary_Restart/outputs/
+MERIX SUBMISSION/Boundary_Restart/outputs/*
+!MERIX SUBMISSION/Boundary_Restart/outputs/local_runs/
+MERIX SUBMISSION/Boundary_Restart/outputs/local_runs/*
+!MERIX SUBMISSION/Boundary_Restart/outputs/local_runs/paper_outer_baselines_*seed42_cnn1d*/
+MERIX SUBMISSION/Boundary_Restart/outputs/local_runs/paper_outer_baselines_*seed42_cnn1d*/**
+!MERIX SUBMISSION/Boundary_Restart/outputs/local_runs/paper_outer_baselines_*seed42_cnn1d*/**/
+!MERIX SUBMISSION/Boundary_Restart/outputs/local_runs/paper_outer_baselines_*seed42_cnn1d*/**/detector_best.pt
+!MERIX SUBMISSION/Boundary_Restart/outputs/local_runs/paper_outer_baselines_*seed42_cnn1d*/**/detector_scaler_stats.npz
 
 # Outer baseline / ablation generated reports
 MERIX SUBMISSION/Boundary_Restart/reports/paper_outer_baselines_*/
@@ -30,13 +37,20 @@ MERIX SUBMISSION/Boundary_Restart/reports/paper_outer_baselines_*/**
 !MERIX SUBMISSION/Boundary_Restart/reports/paper_outer_baselines_*/commands.txt
 !MERIX SUBMISSION/Boundary_Restart/reports/paper_outer_baselines_*/**/summary.json
 !MERIX SUBMISSION/Boundary_Restart/reports/paper_outer_baselines_*/**/command.txt
+!MERIX SUBMISSION/Boundary_Restart/reports/paper_outer_baselines_*seed42_cnn1d*/**/detector_best.pt
+!MERIX SUBMISSION/Boundary_Restart/reports/paper_outer_baselines_*seed42_cnn1d*/**/detector_scaler_stats.npz
 !MERIX SUBMISSION/Boundary_Restart/reports/paper_outer_baselines_*/**/candidates.json
 !MERIX SUBMISSION/Boundary_Restart/reports/paper_outer_baselines_*/**/inner_folds.json
 !MERIX SUBMISSION/Boundary_Restart/reports/paper_outer_missing_baselines_seed*/
 MERIX SUBMISSION/Boundary_Restart/reports/paper_outer_missing_baselines_seed*/**
+!MERIX SUBMISSION/Boundary_Restart/reports/paper_outer_missing_baselines_seed42/
+!MERIX SUBMISSION/Boundary_Restart/reports/paper_outer_missing_baselines_seed42/**/
 !MERIX SUBMISSION/Boundary_Restart/reports/paper_outer_missing_baselines_seed*/outer_summary_by_level.csv
 !MERIX SUBMISSION/Boundary_Restart/reports/paper_outer_missing_baselines_seed*/outer_summary_mean.csv
 !MERIX SUBMISSION/Boundary_Restart/reports/paper_outer_missing_baselines_seed*/run_metadata.json
+!MERIX SUBMISSION/Boundary_Restart/reports/paper_outer_missing_baselines_seed42/all_boundary_direct/**/model.pkl
+!MERIX SUBMISSION/Boundary_Restart/reports/paper_outer_missing_baselines_seed42/periodic_k_direct/**/model.pkl
+!MERIX SUBMISSION/Boundary_Restart/reports/paper_outer_missing_baselines_seed42/downbeat_only_direct/**/model.pkl
 !MERIX SUBMISSION/Boundary_Restart/reports/paper_outer_all_baseline_summary_seed*.csv
 !MERIX SUBMISSION/Boundary_Restart/reports/paper_outer_all_baseline_summary_seed*.json
 

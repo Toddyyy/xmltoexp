@@ -1,6 +1,9 @@
 # Virtual environments
 .venv/
 
+# OS junk
+.DS_Store
+
 # Python caches
 __pycache__/
 *.pyc
@@ -11,6 +14,13 @@ MERIX SUBMISSION/MIREX_Model/check
 
 # Boundary_Restart generated artifacts
 MERIX SUBMISSION/Boundary_Restart/outputs/
+
+# Outer baseline / ablation generated reports
+MERIX SUBMISSION/Boundary_Restart/reports/paper_outer_baselines_*/
+MERIX SUBMISSION/Boundary_Restart/reports/paper_outer_missing_baselines_seed*/
+MERIX SUBMISSION/Boundary_Restart/reports/paper_outer_all_baseline_summary_seed*/
+MERIX SUBMISSION/Boundary_Restart/reports/tmp_*/
+MERIX SUBMISSION/Boundary_Restart/reports/*smoke*/
 
 # Boundary_Restart nested CV reports: keep only small summaries
 MERIX SUBMISSION/Boundary_Restart/reports/nested_piece_cv/**
@@ -26,5 +36,8 @@ MERIX SUBMISSION/Boundary_Restart/reports/clean_outer_test/**
 !MERIX SUBMISSION/Boundary_Restart/reports/clean_outer_test/**/
 !MERIX SUBMISSION/Boundary_Restart/reports/clean_outer_test/**/summary.json
 !MERIX SUBMISSION/Boundary_Restart/reports/clean_outer_test/**/frozen_selection.json
+
+# M06-2 webviz local export artifacts
+MERIX SUBMISSION/M06-2_XML_WebViz/exports/
 
 latex/

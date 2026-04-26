@@ -1,0 +1,44 @@
+{
+  "model": "lbdm",
+  "target_mode": "level4plus_boundary",
+  "level_label": "L4+",
+  "target_design": "weighted_topdown",
+  "feature_family": "all",
+  "outer_heldout_pieces": [
+    "M06-1",
+    "M06-2",
+    "M06-3"
+  ],
+  "seed": 44,
+  "min_train_frequency_target": 0.05,
+  "selection_metric": "weighted_recall",
+  "precision_metric": "union_precision",
+  "min_precision": 0.85,
+  "fixed_threshold": 0.8152439002765388,
+  "feature_columns": [
+    "lbdm_score"
+  ],
+  "train_piece_count": 41,
+  "outer_piece_count": 3,
+  "inner_fold_count": 41,
+  "direct_rule": false,
+  "context_window_radius": 0,
+  "period_k": null,
+  "union_metrics": {
+    "threshold": 0.8152438998222351,
+    "union_precision": 0.5434782608695652,
+    "frequency_weighted_precision": 0.05447570396506268,
+    "consensus_precision": 0.0,
+    "union_recall": 0.16556291390728478,
+    "union_f1": 0.2538071065989848,
+    "weighted_recall": 0.1715844148338826,
+    "consensus_recall": 0.0,
+    "mean_offset": 0.28,
+    "matches": 25,
+    "pred_events": 46,
+    "true_union_events": 151,
+    "true_consensus_events": 5,
+    "matched_weight": 2.5058823823928833,
+    "total_weight": 14.604370594024658
+  }
+}

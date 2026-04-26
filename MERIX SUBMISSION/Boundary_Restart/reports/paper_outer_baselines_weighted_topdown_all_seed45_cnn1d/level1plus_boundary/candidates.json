@@ -1,0 +1,21 @@
+[
+  {
+    "model": "cnn",
+    "detector_target": "level1plus_boundary",
+    "selection_metric": "weighted_recall",
+    "precision_metric": "union_precision",
+    "min_precision": 0.85,
+    "loss_type": "bce",
+    "rest_span_label_mode": "none",
+    "rest_span_tolerance_negative_weight": 1.0,
+    "min_train_frequency_target": 0.05,
+    "cumulative_merge_tolerance": 2,
+    "cumulative_component_weights_json": "{\"level56\":1.0,\"level4\":0.64,\"level3\":0.46,\"level2\":0.28,\"level1\":0.16}",
+    "device": "cuda",
+    "batch_size": 128,
+    "epochs": 60,
+    "early_stop_patience": 10,
+    "seed": 45,
+    "skip_stage_grading": true
+  }
+]

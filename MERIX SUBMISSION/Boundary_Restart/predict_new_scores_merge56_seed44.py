@@ -29,7 +29,7 @@ from train_piece_union_protocol import (
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_CONFIG = ROOT / "configs" / "salience_grouped3_hi8_score_only_xml_curated.yaml"
-DEFAULT_CLEAN_ROOT = ROOT / "reports" / "clean_outer_test"
+DEFAULT_SUMMARY_ROOT = ROOT / "reports" / "clean_outer_test"
 DEFAULT_TARGET_SCORES = [
     (
         "beethoven_pathetique_ii",
@@ -57,6 +57,15 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Predict hierarchical phrase boundaries for new scores with merged56 seed44 models.")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG))
     parser.add_argument("--device", default="auto")
+    parser.add_argument(
+        "--summary_root",
+        default=str(DEFAULT_SUMMARY_ROOT),
+        help=(
+            "Root directory containing detector summaries. "
+            "Supports both clean_outer_test format and "
+            "paper_outer_baselines_* format."
+        ),
+    )
     parser.add_argument("--output_dir", default=str(ROOT / "reports" / "new_score_predictions_merge56_seed44"))
     parser.add_argument("--score", nargs="*", default=None, help="Optional score paths. If omitted, the three default target scores are used.")
     parser.add_argument("--piece_id", nargs="*", default=None, help="Optional piece ids matching --score.")
@@ -236,12 +245,54 @@ def checkpoint_path_from_nested_dir(nested_dir: Path) -> Path:
     return matches[0]
 
 
-def load_level_runtime(cfg: dict, clean_root: Path, detector_target: str, seed: int, device: torch.device) -> dict:
-    summary_path = clean_root / f"weighted_topdown_merge56_{detector_target}_seed{seed}" / "summary.json"
-    if not summary_path.exists():
-        raise FileNotFoundError(f"Missing clean outer summary: {summary_path}")
+def checkpoint_path_from_outer_dir(outer_dir: Path, candidate_slug: str | None = None) -> Path:
+    if candidate_slug:
+        candidate_path = outer_dir / candidate_slug / "detector_best.pt"
+        if candidate_path.exists():
+            return candidate_path
+    matches = sorted(outer_dir.rglob("detector_best.pt"))
+    if not matches:
+        raise FileNotFoundError(f"No detector_best.pt found under {outer_dir}")
+    return matches[0]
+
+
+def resolve_summary_path(summary_root: Path, detector_target: str, seed: int) -> tuple[Path, str]:
+    clean_style = summary_root / f"weighted_topdown_merge56_{detector_target}_seed{seed}" / "summary.json"
+    baseline_style = summary_root / detector_target / "summary.json"
+    if clean_style.exists():
+        return clean_style, "clean_outer"
+    if baseline_style.exists():
+        return baseline_style, "baseline_outer"
+    raise FileNotFoundError(
+        "Missing summary for detector "
+        f"{detector_target} (seed {seed}) under {summary_root}. "
+        f"Tried: {clean_style} and {baseline_style}"
+    )
+
+
+def load_level_runtime(cfg: dict, summary_root: Path, detector_target: str, seed: int, device: torch.device) -> dict:
+    summary_path, summary_style = resolve_summary_path(summary_root, detector_target=detector_target, seed=seed)
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
-    checkpoint_path = checkpoint_path_from_nested_dir(Path(summary["nested_report_dir"]))
+
+    threshold: float
+    frozen_epochs: int
+    if "nested_report_dir" in summary:
+        checkpoint_path = checkpoint_path_from_nested_dir(Path(summary["nested_report_dir"]))
+        threshold = float(summary["frozen_threshold"])
+        frozen_epochs = int(summary.get("frozen_epochs", -1))
+    elif "outer_test_summary" in summary:
+        candidate_slug = str(summary.get("best_candidate", {}).get("candidate_slug", "")).strip() or None
+        outer_dir = summary_path.parent / "outer_test"
+        checkpoint_path = checkpoint_path_from_outer_dir(outer_dir, candidate_slug=candidate_slug)
+        outer_summary = summary["outer_test_summary"]
+        threshold = float(outer_summary["union_metrics"]["threshold"])
+        frozen_epochs = int(outer_summary.get("best_epoch", -1))
+    else:
+        raise KeyError(
+            f"Unrecognized summary schema in {summary_path}; "
+            "expected nested_report_dir or outer_test_summary."
+        )
+
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     model = build_sequence_model(
         str(checkpoint["model_type"]),
@@ -257,10 +308,11 @@ def load_level_runtime(cfg: dict, clean_root: Path, detector_target: str, seed: 
         "feature_columns": list(checkpoint["feature_columns"]),
         "mean": np.asarray(checkpoint["mean"], dtype=np.float32),
         "std": np.asarray(checkpoint["std"], dtype=np.float32),
-        "threshold": float(summary["frozen_threshold"]),
-        "frozen_epochs": int(summary["frozen_epochs"]),
+        "threshold": float(threshold),
+        "frozen_epochs": int(frozen_epochs),
         "checkpoint_path": str(checkpoint_path.resolve()),
-        "clean_summary_path": str(summary_path.resolve()),
+        "summary_path": str(summary_path.resolve()),
+        "summary_style": summary_style,
     }
 
 
@@ -350,12 +402,18 @@ def main() -> None:
         prominence=float(data_cfg.get("peak_prominence", 0.05)),
     )
     device = resolve_device(args.device)
-    clean_root = DEFAULT_CLEAN_ROOT
+    summary_root = Path(args.summary_root).resolve()
     output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
     runtimes = {
-        label: load_level_runtime(cfg, clean_root=clean_root, detector_target=detector_target, seed=int(args.seed), device=device)
+        label: load_level_runtime(
+            cfg,
+            summary_root=summary_root,
+            detector_target=detector_target,
+            seed=int(args.seed),
+            device=device,
+        )
         for label, detector_target in LEVEL_SPECS.items()
     }
     targets = resolve_targets(args)
@@ -380,7 +438,8 @@ def main() -> None:
             "threshold": float(runtime["threshold"]),
             "frozen_epochs": int(runtime["frozen_epochs"]),
             "checkpoint_path": runtime["checkpoint_path"],
-            "clean_summary_path": runtime["clean_summary_path"],
+            "summary_path": runtime["summary_path"],
+            "summary_style": runtime["summary_style"],
         }
 
     for piece_id, score_path in targets:

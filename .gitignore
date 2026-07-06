@@ -31,6 +31,15 @@ dist/
 tmp/
 temp/
 
+# LaTeX build outputs
+*.aux
+*.bbl
+*.blg
+*.fdb_latexmk
+*.fls
+*.synctex.gz
+latex_working_copy/*.pdf
+
 # Large local datasets and downloaded model weights
 datasets/
 aria/
@@ -41,13 +50,17 @@ MIDI-BERT-CP/Data/
 # Generated experiment outputs
 MERIX SUBMISSION/Boundary_Restart/reports/**
 MERIX SUBMISSION/Boundary_Restart/outputs/**
+MERIX SUBMISSION/M06-2_XML_WebViz/exports/**
 MERIX SUBMISSION/MIREX_Model/*/
+MERIX SUBMISSION/MIREX_Model/*.csv
 MERIX SUBMISSION/MIREX_Model/**/outputs/**
+MERIX SUBMISSION/MIREX_Model_meter_auto/
 MERIX SUBMISSION/MIREX_Model_meter_auto/outputs/**
 boundary_detector/data/
 boundary_detector/results/
 
 # HPC scheduler logs
+*.sbatch
 slurm-*.out
 slurm-*.err
 

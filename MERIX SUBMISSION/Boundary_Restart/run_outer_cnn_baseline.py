@@ -41,7 +41,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_inner_folds", type=int, default=None)
     parser.add_argument("--selection_metric", default="weighted_recall")
     parser.add_argument("--precision_metric", default="union_precision")
+    parser.add_argument("--model", choices=["cnn", "cnn_crf"], default="cnn")
     parser.add_argument("--min_train_frequency_target", type=float, default=0.05)
+    parser.add_argument("--label_engineering", choices=["none", "exponential_decay", "linear_ascend"], default="none")
+    parser.add_argument("--label_decay_radius", type=int, default=2)
+    parser.add_argument("--label_decay_rate", type=float, default=0.5)
+    parser.add_argument("--center_margin", type=float, default=0.05)
+    parser.add_argument("--center_margin_weight", type=float, default=0.0)
+    parser.add_argument("--phase_loss_weight", type=float, default=0.0)
+    parser.add_argument("--linear_max_span", type=int, default=64)
+    parser.add_argument("--crf_state_count", type=int, default=64)
+    parser.add_argument("--cumulative_merge_tolerance", type=int, default=2)
+    parser.add_argument("--event_decoder", choices=["peak", "crf"], default="peak")
+    parser.add_argument("--event_tolerance", type=int, default=None)
     parser.add_argument("--output_dir", default=None)
     parser.add_argument("--reuse_existing", action="store_true")
     return parser.parse_args()
@@ -56,7 +68,7 @@ def main() -> None:
 
     output_dir = Path(
         args.output_dir
-        or (project_dir / "reports" / f"paper_outer_baselines_weighted_topdown_all_seed{args.seed}_cnn1d")
+        or (project_dir / "reports" / f"paper_outer_baselines_weighted_topdown_all_seed{args.seed}_{args.model}")
     ).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -77,7 +89,7 @@ def main() -> None:
             "--inner_mode",
             str(args.inner_mode),
             "--model",
-            "cnn",
+            str(args.model),
             "--detector_target",
             target_mode,
             "--selection_metric",
@@ -90,10 +102,28 @@ def main() -> None:
             "bce",
             "--min_train_frequency_target",
             str(float(args.min_train_frequency_target)),
+            "--label_engineering",
+            str(args.label_engineering),
+            "--label_decay_radius",
+            str(int(args.label_decay_radius)),
+            "--label_decay_rate",
+            str(float(args.label_decay_rate)),
+            "--center_margin",
+            str(float(args.center_margin)),
+            "--center_margin_weight",
+            str(float(args.center_margin_weight)),
+            "--phase_loss_weight",
+            str(float(args.phase_loss_weight)),
+            "--linear_max_span",
+            str(int(args.linear_max_span)),
+            "--crf_state_count",
+            str(int(args.crf_state_count)),
             "--cumulative_merge_tolerance",
-            "2",
+            str(int(args.cumulative_merge_tolerance)),
             "--cumulative_component_weights_json",
             WEIGHTS_JSON,
+            "--event_decoder",
+            str(args.event_decoder),
             "--device",
             str(args.device),
             "--batch_size",
@@ -109,6 +139,8 @@ def main() -> None:
             "--output_dir",
             str(target_out),
         ]
+        if args.event_tolerance is not None:
+            command.extend(["--event_tolerance", str(int(args.event_tolerance))])
         if args.max_inner_folds is not None:
             command.extend(["--max_inner_folds", str(int(args.max_inner_folds))])
         if args.reuse_existing:
@@ -124,7 +156,8 @@ def main() -> None:
         union_metrics = outer_summary["union_metrics"]
         summary_rows.append(
             {
-                "model": "cnn",
+                "model": str(args.model),
+                "sequence_model": str(args.model),
                 "target_design": "weighted_topdown",
                 "feature_family": "all",
                 "level_label": level_label,
@@ -180,6 +213,15 @@ def main() -> None:
                 "early_stop_patience": int(args.early_stop_patience),
                 "inner_mode": str(args.inner_mode),
                 "max_inner_folds": None if args.max_inner_folds is None else int(args.max_inner_folds),
+                "event_tolerance": None if args.event_tolerance is None else int(args.event_tolerance),
+                "label_engineering": str(args.label_engineering),
+                "label_decay_radius": int(args.label_decay_radius),
+                "label_decay_rate": float(args.label_decay_rate),
+                "center_margin": float(args.center_margin),
+                "center_margin_weight": float(args.center_margin_weight),
+                "phase_loss_weight": float(args.phase_loss_weight),
+                "linear_max_span": int(args.linear_max_span),
+                "crf_state_count": int(args.crf_state_count),
                 "reuse_existing": bool(args.reuse_existing),
             },
             indent=2,

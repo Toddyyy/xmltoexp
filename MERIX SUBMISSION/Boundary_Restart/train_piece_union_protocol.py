@@ -7,6 +7,7 @@ import copy
 import json
 import random
 import re
+import sys
 from collections import deque
 from pathlib import Path
 
@@ -24,13 +25,16 @@ from boundary_restart.cumulative_targets import (
     COMPONENT_RAW_LEVELS,
     build_piece_frequency_for_raw_levels,
     build_topdown_cumulative_frequency,
+    build_weighted_sum_frequency,
     cumulative_components_for_target,
+    weighted_sum_components_for_target,
 )
 from boundary_restart.derived_features import add_highlevel_derived_features
 from boundary_restart.features import PeakConfig, boundary_probs_to_binary, load_boundary_npz, replace_level_suffix
 from boundary_restart.metrics import (
+    decode_events,
     evaluate_labeled_event_sequences,
-    extract_events,
+    evaluate_union_frequency_event_sets,
     greedy_match_pairs,
     search_union_frequency_threshold,
 )
@@ -57,6 +61,92 @@ RAW_LEVEL_GROUP_TARGETS = {
     "level34_boundary": (3, 4),
     "level56_boundary": (5, 6),
 }
+
+
+class LinearChainCRF(nn.Module):
+    def __init__(self, num_states: int):
+        super().__init__()
+        self.num_states = int(num_states)
+        if self.num_states < 2:
+            raise ValueError("num_states must be at least 2")
+        self.transitions = nn.Parameter(torch.zeros(self.num_states, self.num_states))
+        self.start_transitions = nn.Parameter(torch.zeros(self.num_states))
+        self.end_transitions = nn.Parameter(torch.zeros(self.num_states))
+        allowed = torch.full((self.num_states, self.num_states), -10000.0, dtype=torch.float32)
+        # State 0 is a boundary. States 1..K-1 are beats elapsed since the last boundary, capped at K-1.
+        allowed[0, 0] = 0.0
+        allowed[0, 1] = 0.0
+        for state in range(1, self.num_states):
+            allowed[state, 0] = 0.0
+            allowed[state, min(state + 1, self.num_states - 1)] = 0.0
+        self.register_buffer("transition_mask", allowed)
+
+    def _masked_transitions(self) -> torch.Tensor:
+        return self.transitions + self.transition_mask
+
+    def negative_log_likelihood(self, emissions: torch.Tensor, tags: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        emissions = emissions.float()
+        tags = tags.long()
+        mask = mask.bool()
+        log_denominator = self._compute_log_partition(emissions, mask)
+        log_numerator = self._compute_sequence_score(emissions, tags, mask)
+        return (log_denominator - log_numerator).mean()
+
+    def _compute_sequence_score(self, emissions: torch.Tensor, tags: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        batch_size, seq_len, _ = emissions.shape
+        transitions = self._masked_transitions()
+        first_tags = tags[:, 0]
+        score = self.start_transitions[first_tags] + emissions[torch.arange(batch_size, device=emissions.device), 0, first_tags]
+        score = score * mask[:, 0].float()
+        for pos in range(1, seq_len):
+            prev_tags = tags[:, pos - 1]
+            curr_tags = tags[:, pos]
+            transition_score = transitions[prev_tags, curr_tags]
+            emission_score = emissions[torch.arange(batch_size, device=emissions.device), pos, curr_tags]
+            score = score + (transition_score + emission_score) * mask[:, pos].float()
+        lengths = mask.long().sum(dim=1).clamp(min=1)
+        last_tags = tags[torch.arange(batch_size, device=emissions.device), lengths - 1]
+        score = score + self.end_transitions[last_tags]
+        return score
+
+    def _compute_log_partition(self, emissions: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        transitions = self._masked_transitions()
+        score = self.start_transitions + emissions[:, 0, :]
+        score = torch.where(mask[:, 0].unsqueeze(1), score, self.start_transitions.unsqueeze(0))
+        for pos in range(1, emissions.size(1)):
+            next_score = torch.logsumexp(score.unsqueeze(2) + transitions.unsqueeze(0), dim=1) + emissions[:, pos, :]
+            score = torch.where(mask[:, pos].unsqueeze(1), next_score, score)
+        score = score + self.end_transitions
+        return torch.logsumexp(score, dim=1)
+
+    @torch.no_grad()
+    def viterbi_decode(self, emissions: torch.Tensor, mask: torch.Tensor) -> list[list[int]]:
+        emissions = emissions.float()
+        mask = mask.bool()
+        transitions = self._masked_transitions()
+        batch_paths: list[list[int]] = []
+        for batch_idx in range(emissions.size(0)):
+            length = int(mask[batch_idx].long().sum().item())
+            if length <= 0:
+                batch_paths.append([])
+                continue
+            emit = emissions[batch_idx, :length]
+            score = self.start_transitions + emit[0]
+            history: list[torch.Tensor] = []
+            for pos in range(1, length):
+                next_score = score.unsqueeze(1) + transitions
+                best_score, best_prev = next_score.max(dim=0)
+                score = best_score + emit[pos]
+                history.append(best_prev)
+            score = score + self.end_transitions
+            best_last = int(score.argmax().item())
+            path = [best_last]
+            for backptr in reversed(history):
+                best_last = int(backptr[best_last].item())
+                path.append(best_last)
+            path.reverse()
+            batch_paths.append(path)
+        return batch_paths
 
 
 def set_seed(seed: int):
@@ -203,8 +293,13 @@ def build_piece_union_frame(
 ) -> pd.DataFrame:
     frame = df.copy()
     cumulative_components = cumulative_components_for_target(target_mode)
+    weighted_sum_components = weighted_sum_components_for_target(target_mode)
     raw_levels = parse_raw_level_targets(target_mode)
-    if cumulative_components is not None and int(cumulative_merge_tolerance) > 0:
+    use_weighted_sum = weighted_sum_components is not None
+    use_topdown_cumulative = cumulative_components is not None and (
+        int(cumulative_merge_tolerance) > 0 or cumulative_component_weights is not None
+    )
+    if use_weighted_sum or use_topdown_cumulative:
         pass
     elif raw_levels is not None:
         if "source_path" not in frame.columns:
@@ -254,7 +349,26 @@ def build_piece_union_frame(
         .rename(columns={"sample_id": "performer_count"})
         .reset_index()
     )
-    if cumulative_components is not None and int(cumulative_merge_tolerance) > 0:
+    if use_weighted_sum:
+        component_map = {
+            component_name: build_piece_frequency_for_raw_levels(
+                frame,
+                raw_levels=COMPONENT_RAW_LEVELS[component_name],
+                peak_cfg=peak_cfg,
+                beat_unit_fallback=beat_unit_fallback,
+            )
+            for component_name in weighted_sum_components
+        }
+        merged = build_weighted_sum_frequency(
+            piece[["piece_id", "beat_idx"]],
+            component_map=component_map,
+            component_order=weighted_sum_components,
+            component_weights=cumulative_component_weights,
+            clip_max=1.0,
+        )
+        piece = piece.merge(merged, on=["piece_id", "beat_idx"], how="left")
+        piece["frequency_target"] = piece["frequency_target"].fillna(0.0).astype(np.float32)
+    elif use_topdown_cumulative:
         component_map = {
             component_name: build_piece_frequency_for_raw_levels(
                 frame,
@@ -353,6 +467,253 @@ def apply_rest_span_training_labels(
     return pd.concat(updated_groups, axis=0, ignore_index=True)
 
 
+def apply_boundary_label_engineering(
+    piece_df: pd.DataFrame,
+    mode: str,
+    decay_radius: int,
+    decay_rate: float,
+    linear_max_span: int,
+) -> pd.DataFrame:
+    """Add denser training labels while keeping evaluation targets unchanged."""
+    frame = piece_df.copy()
+    mode = str(mode)
+    if "train_frequency_target" not in frame.columns:
+        frame["train_frequency_target"] = frame["frequency_target"].astype(np.float32)
+    if "train_union_target" not in frame.columns:
+        frame["train_union_target"] = frame["union_target"].astype(np.float32)
+    frame["train_center_target"] = frame["train_frequency_target"].astype(np.float32)
+    frame["train_phase_target"] = np.zeros(len(frame), dtype=np.float32)
+    if mode == "none":
+        return frame
+
+    updated_groups = []
+    for _, group in frame.sort_values(["piece_id", "beat_idx"]).groupby("piece_id", sort=False):
+        group = group.copy().reset_index(drop=True)
+        center_freq = group["train_frequency_target"].to_numpy(dtype=np.float32).copy()
+        center_idx = np.flatnonzero(center_freq > 0.0).astype(np.int32)
+        group["train_center_target"] = center_freq.astype(np.float32)
+
+        if mode == "exponential_decay":
+            soft = center_freq.copy()
+            radius = max(int(decay_radius), 0)
+            decay = float(decay_rate)
+            for idx in center_idx.tolist():
+                center_value = float(center_freq[idx])
+                for distance in range(1, radius + 1):
+                    value = center_value * (decay**distance)
+                    left = idx - distance
+                    right = idx + distance
+                    if left >= 0:
+                        soft[left] = max(float(soft[left]), value)
+                    if right < soft.shape[0]:
+                        soft[right] = max(float(soft[right]), value)
+            group["train_frequency_target"] = soft.astype(np.float32)
+            group["train_union_target"] = (soft > 0.0).astype(np.float32)
+        elif mode == "linear_ascend":
+            phase = np.zeros_like(center_freq, dtype=np.float32)
+            if center_idx.size > 0:
+                starts = center_idx.tolist()
+                if starts[0] != 0:
+                    starts = [0] + starts
+                if starts[-1] != len(phase):
+                    starts.append(len(phase))
+                for start, end in zip(starts[:-1], starts[1:]):
+                    length = max(int(end - start), 1)
+                    denom = float(max(min(length, int(linear_max_span)), 1))
+                    for pos in range(start, end):
+                        phase[pos] = min(float(pos - start) / denom, 1.0)
+            group["train_phase_target"] = phase.astype(np.float32)
+        else:
+            raise ValueError(f"Unsupported label_engineering mode: {mode}")
+        updated_groups.append(group)
+    return pd.concat(updated_groups, axis=0, ignore_index=True)
+
+
+def _performer_key(value) -> str:
+    text = str(value)
+    if text.endswith(".0"):
+        text = text[:-2]
+    if text.isdigit():
+        text = str(int(text))
+    return text
+
+
+def build_mean_tempo_curves_for_labeling(
+    source_df: pd.DataFrame,
+    manifest_path: str | Path | None,
+    *,
+    smooth_window: int,
+    bpm_max: float,
+) -> tuple[dict[str, np.ndarray], list[dict]]:
+    """Build piece-level mean tempo curves for tempo-tolerant training labels."""
+    if manifest_path is None or str(manifest_path).strip() == "":
+        return {}, []
+    manifest_path = Path(manifest_path).expanduser().resolve()
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"Missing tempo-label manifest: {manifest_path}")
+    required_cols = {"piece_id", "performer_id", "beat_idx", "local_beat_unit", "meter_segment_idx"}
+    missing = sorted(required_cols - set(source_df.columns))
+    if missing:
+        raise ValueError(f"tempo-tolerant labels require beat-table columns: {missing}")
+
+    meter_auto_root = Path(__file__).resolve().parents[1] / "MIREX_Model_meter_auto"
+    if str(meter_auto_root) not in sys.path:
+        sys.path.insert(0, str(meter_auto_root))
+    from run_atepp_auto_meter_crf_transfer import load_tempo_arrays  # noqa: WPS433
+
+    manifest = pd.read_csv(manifest_path)
+    if not {"piece_id", "piece_dir"}.issubset(manifest.columns):
+        raise ValueError(f"{manifest_path} must contain piece_id and piece_dir columns.")
+    piece_dir_map = dict(zip(manifest["piece_id"].astype(str), manifest["piece_dir"].astype(str)))
+
+    table = source_df[list(required_cols)].copy()
+    table["piece_id"] = table["piece_id"].astype(str)
+    table["performer_id"] = table["performer_id"].map(_performer_key)
+    curves: dict[str, np.ndarray] = {}
+    skipped: list[dict] = []
+    for piece_id, piece_frame in table.groupby("piece_id", sort=False):
+        if piece_id not in piece_dir_map:
+            skipped.append({"piece_id": piece_id, "reason": "missing_manifest_piece_dir"})
+            continue
+        beat_units = sorted(piece_frame["local_beat_unit"].dropna().astype(float).unique().tolist())
+        segment_count = int(piece_frame["meter_segment_idx"].nunique())
+        if len(beat_units) != 1 or segment_count != 1:
+            skipped.append(
+                {
+                    "piece_id": piece_id,
+                    "reason": f"unsupported_mixed_or_nonunique_grid segments={segment_count} beat_units={beat_units}",
+                }
+            )
+            continue
+        num_beats = int(piece_frame["beat_idx"].max()) + 1
+        try:
+            tempo_arrays, failed = load_tempo_arrays(
+                piece_dir=Path(piece_dir_map[piece_id]),
+                num_beats=num_beats,
+                beat_unit=float(beat_units[0]),
+                smooth_window=int(smooth_window),
+                bpm_max=float(bpm_max),
+            )
+        except Exception as exc:  # pragma: no cover - diagnostic path.
+            skipped.append({"piece_id": piece_id, "reason": f"load_tempo_arrays_failed: {exc}"})
+            continue
+        for failed_item in failed:
+            skipped.append({"piece_id": piece_id, "reason": "failed_match", **failed_item})
+        tempo_arrays = {_performer_key(key): np.asarray(value, dtype=np.float32) for key, value in tempo_arrays.items()}
+        keep_performers = set(piece_frame["performer_id"].dropna().map(_performer_key).unique().tolist())
+        selected = [curve for performer, curve in tempo_arrays.items() if performer in keep_performers]
+        if not selected:
+            skipped.append({"piece_id": piece_id, "reason": "no_retained_performer_tempo_curve"})
+            continue
+        curves[piece_id] = np.nanmean(np.vstack(selected), axis=0).astype(np.float32)
+    return curves, skipped
+
+
+def _tempo_rel_diff(curve: np.ndarray, source_idx: int, target_idx: int) -> float:
+    if source_idx < 0 or target_idx < 0 or source_idx >= len(curve) or target_idx >= len(curve):
+        return float("inf")
+    source_tempo = float(curve[source_idx])
+    target_tempo = float(curve[target_idx])
+    if not np.isfinite(source_tempo) or not np.isfinite(target_tempo):
+        return float("inf")
+    return abs(source_tempo - target_tempo) / max(abs(source_tempo), 1e-6)
+
+
+def apply_tempo_tolerant_training_labels(
+    piece_df: pd.DataFrame,
+    mean_tempo_by_piece: dict[str, np.ndarray],
+    *,
+    beat_tolerance: int,
+    tempo_rel_tolerance: float,
+    apply_split: str,
+) -> tuple[pd.DataFrame, dict]:
+    """Expand training labels to neighboring beats that are tempo-equivalent."""
+    frame = piece_df.copy()
+    if int(beat_tolerance) <= 0:
+        return frame, {"enabled": False}
+    if not mean_tempo_by_piece:
+        raise ValueError("tempo-tolerant labels requested, but no tempo curves were loaded.")
+    if "train_frequency_target" not in frame.columns:
+        frame["train_frequency_target"] = frame["frequency_target"].astype(np.float32)
+    if "train_union_target" not in frame.columns:
+        frame["train_union_target"] = frame["union_target"].astype(np.float32)
+
+    updated_groups = []
+    total_added = 0
+    total_sources = 0
+    skipped_pieces: list[str] = []
+    for piece_id, group in frame.sort_values(["piece_id", "beat_idx"]).groupby("piece_id", sort=False):
+        group = group.copy().reset_index(drop=True)
+        piece_key = str(piece_id)
+        curve = mean_tempo_by_piece.get(piece_key)
+        if curve is None:
+            skipped_pieces.append(piece_key)
+            updated_groups.append(group)
+            continue
+        train_mask = group["protocol_split"].astype(str).eq(str(apply_split)).to_numpy(dtype=bool)
+        beat_idx = group["beat_idx"].to_numpy(dtype=np.int32)
+        beat_to_pos = {int(beat): pos for pos, beat in enumerate(beat_idx.tolist())}
+        train_freq = group["train_frequency_target"].to_numpy(dtype=np.float32).copy()
+        original_freq = train_freq.copy()
+        source_positions = np.flatnonzero((original_freq > 0.0) & train_mask).astype(np.int32)
+        total_sources += int(source_positions.size)
+        added_positions: set[int] = set()
+        for source_pos in source_positions.tolist():
+            source_beat = int(beat_idx[source_pos])
+            source_value = float(original_freq[source_pos])
+            for offset in range(-int(beat_tolerance), int(beat_tolerance) + 1):
+                if offset == 0:
+                    continue
+                target_beat = source_beat + offset
+                target_pos = beat_to_pos.get(target_beat)
+                if target_pos is None or not train_mask[target_pos]:
+                    continue
+                if _tempo_rel_diff(curve, source_beat, target_beat) > float(tempo_rel_tolerance):
+                    continue
+                if source_value > float(train_freq[target_pos]):
+                    if float(original_freq[target_pos]) <= 0.0:
+                        added_positions.add(int(target_pos))
+                    train_freq[target_pos] = source_value
+        group["train_frequency_target"] = train_freq.astype(np.float32)
+        group["train_union_target"] = (train_freq > 0.0).astype(np.float32)
+        total_added += len(added_positions)
+        updated_groups.append(group)
+    stats = {
+        "enabled": True,
+        "beat_tolerance": int(beat_tolerance),
+        "tempo_rel_tolerance": float(tempo_rel_tolerance),
+        "apply_split": str(apply_split),
+        "source_events": int(total_sources),
+        "added_training_positions": int(total_added),
+        "skipped_piece_count": int(len(set(skipped_pieces))),
+        "skipped_pieces": sorted(set(skipped_pieces)),
+    }
+    return pd.concat(updated_groups, axis=0, ignore_index=True), stats
+
+
+def apply_multistate_crf_labels(piece_df: pd.DataFrame, state_count: int) -> pd.DataFrame:
+    frame = piece_df.copy()
+    state_count = max(int(state_count), 2)
+    if "train_center_target" not in frame.columns:
+        frame["train_center_target"] = frame["train_frequency_target"].astype(np.float32)
+    updated_groups = []
+    for _, group in frame.sort_values(["piece_id", "beat_idx"]).groupby("piece_id", sort=False):
+        group = group.copy().reset_index(drop=True)
+        center = group["train_center_target"].to_numpy(dtype=np.float32)
+        states = np.zeros(len(group), dtype=np.int64)
+        distance = 1
+        for pos in range(len(group)):
+            if center[pos] > 0.0:
+                states[pos] = 0
+                distance = 1
+            else:
+                states[pos] = min(distance, state_count - 1)
+                distance += 1
+        group["train_crf_state_target"] = states.astype(np.int64)
+        updated_groups.append(group)
+    return pd.concat(updated_groups, axis=0, ignore_index=True)
+
+
 class PieceUnionDataset(Dataset):
     def __init__(
         self,
@@ -384,6 +745,9 @@ class PieceUnionDataset(Dataset):
             "labels": sample["train_frequency_target"].astype(np.float32),
             "union_labels": sample["union_target"].astype(np.float32),
             "frequency_target": sample["frequency_target"].astype(np.float32),
+            "center_labels": sample["train_center_target"].astype(np.float32),
+            "phase_labels": sample["train_phase_target"].astype(np.float32),
+            "crf_state_labels": sample["train_crf_state_target"].astype(np.int64),
             "performer_count": sample["performer_count"].astype(np.int32),
             "loss_weights": build_loss_weights(
                 sample["train_union_target"],
@@ -404,6 +768,9 @@ def collate_piece_union(batch: list[dict]) -> dict:
     labels = torch.zeros(len(batch), max_len, dtype=torch.float32)
     union_labels = torch.zeros(len(batch), max_len, dtype=torch.float32)
     frequency_target = torch.zeros(len(batch), max_len, dtype=torch.float32)
+    center_labels = torch.zeros(len(batch), max_len, dtype=torch.float32)
+    phase_labels = torch.zeros(len(batch), max_len, dtype=torch.float32)
+    crf_state_labels = torch.zeros(len(batch), max_len, dtype=torch.int64)
     performer_count = torch.zeros(len(batch), max_len, dtype=torch.int64)
     loss_weights = torch.ones(len(batch), max_len, dtype=torch.float32)
     beat_idx = torch.zeros(len(batch), max_len, dtype=torch.int64)
@@ -417,6 +784,9 @@ def collate_piece_union(batch: list[dict]) -> dict:
         labels[idx, :length] = torch.from_numpy(item["labels"])
         union_labels[idx, :length] = torch.from_numpy(item["union_labels"])
         frequency_target[idx, :length] = torch.from_numpy(item["frequency_target"])
+        center_labels[idx, :length] = torch.from_numpy(item["center_labels"])
+        phase_labels[idx, :length] = torch.from_numpy(item["phase_labels"])
+        crf_state_labels[idx, :length] = torch.from_numpy(item["crf_state_labels"])
         performer_count[idx, :length] = torch.from_numpy(item["performer_count"])
         loss_weights[idx, :length] = torch.from_numpy(item["loss_weights"])
         beat_idx[idx, :length] = torch.from_numpy(item["beat_idx"])
@@ -429,6 +799,9 @@ def collate_piece_union(batch: list[dict]) -> dict:
         "labels": labels,
         "union_labels": union_labels,
         "frequency_target": frequency_target,
+        "center_labels": center_labels,
+        "phase_labels": phase_labels,
+        "crf_state_labels": crf_state_labels,
         "performer_count": performer_count,
         "loss_weights": loss_weights,
         "beat_idx": beat_idx,
@@ -469,6 +842,15 @@ def piece_samples_from_frame(
                 "train_frequency_target": group["train_frequency_target"].to_numpy(dtype=np.float32)
                 if "train_frequency_target" in group.columns
                 else group["frequency_target"].to_numpy(dtype=np.float32),
+                "train_center_target": group["train_center_target"].to_numpy(dtype=np.float32)
+                if "train_center_target" in group.columns
+                else group["frequency_target"].to_numpy(dtype=np.float32),
+                "train_phase_target": group["train_phase_target"].to_numpy(dtype=np.float32)
+                if "train_phase_target" in group.columns
+                else np.zeros(len(group), dtype=np.float32),
+                "train_crf_state_target": group["train_crf_state_target"].to_numpy(dtype=np.int64)
+                if "train_crf_state_target" in group.columns
+                else np.zeros(len(group), dtype=np.int64),
                 "performer_count": group["performer_count"].to_numpy(dtype=np.int32),
                 "train_loss_factor": group["train_loss_factor"].to_numpy(dtype=np.float32)
                 if "train_loss_factor" in group.columns
@@ -485,11 +867,17 @@ def compute_detector_loss(
     loss_weights: torch.Tensor,
     loss_type: str,
     loss_fn: nn.Module,
+    center_labels: torch.Tensor | None = None,
+    phase_labels: torch.Tensor | None = None,
+    center_margin: float = 0.0,
+    center_margin_weight: float = 0.0,
+    phase_loss_weight: float = 0.0,
 ) -> torch.Tensor:
+    boundary_logits = logits[..., 0] if logits.dim() == 3 else logits
     if loss_type in {"bce", "bce_freq_weighted"}:
-        per_token = loss_fn(logits, labels)
+        per_token = loss_fn(boundary_logits, labels)
     elif loss_type in {"huber", "mse"}:
-        preds = torch.sigmoid(logits)
+        preds = torch.sigmoid(boundary_logits)
         per_token = loss_fn(preds, labels)
     else:
         raise ValueError(f"Unsupported loss_type: {loss_type}")
@@ -501,7 +889,31 @@ def compute_detector_loss(
             freq_factor = torch.ones_like(labels)
             freq_factor[positive_mask] = (labels[positive_mask] / pos_mean).clamp(min=0.25, max=4.0)
             token_weights = token_weights * freq_factor
-    return (per_token * token_weights).sum() / token_weights.sum().clamp(min=1.0)
+    loss = (per_token * token_weights).sum() / token_weights.sum().clamp(min=1.0)
+
+    if center_labels is not None and float(center_margin_weight) > 0.0 and float(center_margin) > 0.0:
+        probs = torch.sigmoid(boundary_logits)
+        center_mask = (center_labels > 0.0) & mask
+        margin_terms = []
+        if probs.size(1) > 1:
+            left_valid = center_mask[:, 1:] & mask[:, :-1]
+            left_center = probs[:, 1:]
+            left_neighbor = probs[:, :-1]
+            if torch.any(left_valid):
+                margin_terms.append(torch.relu(float(center_margin) - (left_center - left_neighbor))[left_valid])
+            right_valid = center_mask[:, :-1] & mask[:, 1:]
+            right_center = probs[:, :-1]
+            right_neighbor = probs[:, 1:]
+            if torch.any(right_valid):
+                margin_terms.append(torch.relu(float(center_margin) - (right_center - right_neighbor))[right_valid])
+        if margin_terms:
+            loss = loss + float(center_margin_weight) * torch.cat(margin_terms).mean()
+
+    if logits.dim() == 3 and logits.size(-1) > 1 and phase_labels is not None and float(phase_loss_weight) > 0.0:
+        phase_pred = torch.sigmoid(logits[..., 1])
+        phase_loss = ((phase_pred - phase_labels) ** 2 * mask.float()).sum() / mask.float().sum().clamp(min=1.0)
+        loss = loss + float(phase_loss_weight) * phase_loss
+    return loss
 
 
 def primary_metric_value(metrics, metric_name: str) -> float:
@@ -550,6 +962,7 @@ def precision_floors_met(metrics, floors: dict[str, float]) -> bool:
 
 def train_one_epoch(
     model,
+    crf,
     loader,
     optimizer,
     device,
@@ -559,6 +972,17 @@ def train_one_epoch(
     ema_state: dict[str, torch.Tensor] | None = None,
     ema_decay: float = 0.0,
     log_interval: int = 0,
+    center_margin: float = 0.0,
+    center_margin_weight: float = 0.0,
+    phase_loss_weight: float = 0.0,
+    crf_aux_regression_weight: float = 0.0,
+    crf_aux_regression_loss: str = "smooth_l1",
+    crf_aux_rank_weight: float = 0.0,
+    crf_aux_rank_margin: float = 0.1,
+    crf_aux_rank_min_freq_gap: float = 0.05,
+    crf_aux_rank_max_pairs: int = 512,
+    count_loss_weight: float = 0.0,
+    count_loss_mode: str = "binary",
 ) -> float:
     model.train()
     total_loss = 0.0
@@ -566,23 +990,101 @@ def train_one_epoch(
     for batch_idx, batch in enumerate(loader, start=1):
         features = batch["features"].to(device)
         labels = batch["labels"].to(device)
+        center_labels = batch["center_labels"].to(device)
+        phase_labels = batch["phase_labels"].to(device)
+        crf_state_labels = batch["crf_state_labels"].to(device)
         loss_weights = batch["loss_weights"].to(device)
         mask = batch["mask"].to(device)
         lengths = batch["lengths"].to(device)
 
         optimizer.zero_grad()
         logits = model(features, lengths=lengths)
-        loss = compute_detector_loss(
-            logits=logits,
-            labels=labels,
-            mask=mask,
-            loss_weights=loss_weights,
-            loss_type=loss_type,
-            loss_fn=loss_fn,
-        )
+        if crf is not None:
+            emissions = logits[..., : crf.num_states] if logits.dim() == 3 else logits
+            loss = crf.negative_log_likelihood(emissions, crf_state_labels, mask)
+            if float(count_loss_weight) > 0.0:
+                boundary_probs = torch.softmax(emissions, dim=-1)[..., 0]
+                count_target = labels if str(count_loss_mode) == "frequency" else (labels > 0.0).float()
+                denom = mask.float().sum(dim=1).clamp(min=1.0)
+                pred_density = (boundary_probs * mask.float()).sum(dim=1) / denom
+                target_density = (count_target * mask.float()).sum(dim=1) / denom
+                loss = loss + float(count_loss_weight) * torch.nn.functional.smooth_l1_loss(
+                    pred_density,
+                    target_density,
+                )
+            if float(crf_aux_regression_weight) > 0.0:
+                if logits.dim() != 3 or logits.size(-1) <= crf.num_states:
+                    raise ValueError("CRF auxiliary regression requires one extra model output beyond CRF states")
+                aux_logits = logits[..., crf.num_states]
+                aux_pred = torch.sigmoid(aux_logits)
+                if str(crf_aux_regression_loss) == "mse":
+                    aux_per_token = (aux_pred - labels) ** 2
+                else:
+                    aux_per_token = torch.nn.functional.smooth_l1_loss(aux_pred, labels, reduction="none")
+                aux_weights = mask.float() * loss_weights
+                aux_loss = (aux_per_token * aux_weights).sum() / aux_weights.sum().clamp(min=1.0)
+                loss = loss + float(crf_aux_regression_weight) * aux_loss
+            if float(crf_aux_rank_weight) > 0.0:
+                if logits.dim() != 3 or logits.size(-1) <= crf.num_states:
+                    raise ValueError("CRF auxiliary ranking requires one extra model output beyond CRF states")
+                aux_scores = logits[..., crf.num_states]
+                rank_terms = []
+                max_pairs = max(int(crf_aux_rank_max_pairs), 1)
+                min_gap = float(crf_aux_rank_min_freq_gap)
+                per_sequence_pairs = max(max_pairs // max(int(features.size(0)), 1), 1)
+                for seq_idx in range(aux_scores.size(0)):
+                    valid = mask[seq_idx]
+                    freq = labels[seq_idx, valid]
+                    scores = aux_scores[seq_idx, valid]
+                    high_positions = torch.nonzero(freq > min_gap, as_tuple=False).flatten()
+                    if high_positions.numel() == 0:
+                        continue
+                    # Rejection-sample pairwise frequency order constraints in vectorized form.
+                    attempts = max(per_sequence_pairs * 8, per_sequence_pairs)
+                    sampled_high = high_positions[
+                        torch.randint(high_positions.numel(), (attempts,), device=high_positions.device)
+                    ]
+                    sampled_low = torch.randint(freq.numel(), (attempts,), device=freq.device)
+                    valid_pairs = freq[sampled_high] >= (freq[sampled_low] + min_gap)
+                    if not torch.any(valid_pairs):
+                        continue
+                    sampled_high = sampled_high[valid_pairs][:per_sequence_pairs]
+                    sampled_low = sampled_low[valid_pairs][:per_sequence_pairs]
+                    freq_gap = (freq[sampled_high] - freq[sampled_low]).clamp(min=min_gap)
+                    pair_loss = torch.relu(float(crf_aux_rank_margin) - (scores[sampled_high] - scores[sampled_low]))
+                    rank_terms.append(pair_loss * freq_gap)
+                if rank_terms:
+                    rank_loss = torch.cat(rank_terms).mean()
+                    loss = loss + float(crf_aux_rank_weight) * rank_loss
+        else:
+            loss = compute_detector_loss(
+                logits=logits,
+                labels=labels,
+                mask=mask,
+                loss_weights=loss_weights,
+                loss_type=loss_type,
+                loss_fn=loss_fn,
+                center_labels=center_labels,
+                phase_labels=phase_labels,
+                center_margin=center_margin,
+                center_margin_weight=center_margin_weight,
+                phase_loss_weight=phase_loss_weight,
+            )
+            if float(count_loss_weight) > 0.0:
+                boundary_logits = logits[..., 0] if logits.dim() == 3 else logits
+                boundary_probs = torch.sigmoid(boundary_logits)
+                count_target = labels if str(count_loss_mode) == "frequency" else (labels > 0.0).float()
+                denom = mask.float().sum(dim=1).clamp(min=1.0)
+                pred_density = (boundary_probs * mask.float()).sum(dim=1) / denom
+                target_density = (count_target * mask.float()).sum(dim=1) / denom
+                loss = loss + float(count_loss_weight) * torch.nn.functional.smooth_l1_loss(
+                    pred_density,
+                    target_density,
+                )
         loss.backward()
         if grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            grad_params = list(model.parameters()) + (list(crf.parameters()) if crf is not None else [])
+            torch.nn.utils.clip_grad_norm_(grad_params, grad_clip)
         optimizer.step()
         if ema_state is not None:
             update_ema_state(ema_state, model, decay=float(ema_decay))
@@ -654,8 +1156,10 @@ def update_ema_state(ema_state: dict[str, torch.Tensor], model: nn.Module, decay
 
 
 @torch.no_grad()
-def predict_detector(model, loader, device) -> pd.DataFrame:
+def predict_detector(model, loader, device, crf: LinearChainCRF | None = None) -> pd.DataFrame:
     model.eval()
+    if crf is not None:
+        crf.eval()
     rows = []
     for batch in loader:
         features = batch["features"].to(device)
@@ -667,10 +1171,25 @@ def predict_detector(model, loader, device) -> pd.DataFrame:
         mask = batch["mask"].to(device)
         lengths = batch["lengths"].to(device)
         logits = model(features, lengths=lengths)
-        probs = torch.sigmoid(logits)
+        if crf is not None:
+            emissions = logits[..., : crf.num_states] if logits.dim() == 3 else logits
+            crf_boundary_probs = torch.softmax(emissions, dim=-1)[..., 0]
+            if logits.dim() == 3 and logits.size(-1) > crf.num_states:
+                probs = torch.sigmoid(logits[..., crf.num_states])
+            else:
+                probs = crf_boundary_probs
+            decoded_paths = crf.viterbi_decode(emissions, mask)
+            phase_probs = None
+        else:
+            boundary_logits = logits[..., 0] if logits.dim() == 3 else logits
+            probs = torch.sigmoid(boundary_logits)
+            crf_boundary_probs = torch.zeros_like(probs)
+            phase_probs = torch.sigmoid(logits[..., 1]) if logits.dim() == 3 and logits.size(-1) > 1 else None
+            decoded_paths = None
         for batch_idx_i, sample_id in enumerate(batch["sample_ids"]):
             length = int(mask[batch_idx_i].sum().item())
             for pos in range(length):
+                decoded_state = int(decoded_paths[batch_idx_i][pos]) if decoded_paths is not None else -1
                 rows.append(
                     {
                         "sample_id": sample_id,
@@ -680,7 +1199,11 @@ def predict_detector(model, loader, device) -> pd.DataFrame:
                         "frequency_target": float(frequency_target[batch_idx_i, pos].item()),
                         "performer_count": int(performer_count[batch_idx_i, pos].item()),
                         "detector_score": float(probs[batch_idx_i, pos].item()),
+                        "crf_boundary_score": float(crf_boundary_probs[batch_idx_i, pos].item()),
+                        "decoded_crf_state": decoded_state,
+                        "decoded_boundary": float(decoded_state == 0) if decoded_state >= 0 else 0.0,
                         "train_label": float(labels[batch_idx_i, pos].item()),
+                        "predicted_phase": float(phase_probs[batch_idx_i, pos].item()) if phase_probs is not None else 0.0,
                     }
                 )
     return pd.DataFrame(rows)
@@ -696,6 +1219,15 @@ def detector_sequence_maps(pred_df: pd.DataFrame) -> tuple[dict[str, np.ndarray]
         sequence_union[sample_id] = group["union_target"].to_numpy(dtype=np.float32)
         sequence_frequency[sample_id] = group["frequency_target"].to_numpy(dtype=np.float32)
     return sequence_scores, sequence_union, sequence_frequency
+
+
+def decoded_event_maps(pred_df: pd.DataFrame) -> dict[str, np.ndarray]:
+    sequence_events = {}
+    ordered = pred_df.sort_values(["sample_id", "beat_idx"])
+    for sample_id, group in ordered.groupby("sample_id", sort=False):
+        decoded = group["decoded_boundary"].to_numpy(dtype=np.float32)
+        sequence_events[sample_id] = np.flatnonzero(decoded > 0.5).astype(np.int32)
+    return sequence_events
 
 
 def grading_report(y_true: np.ndarray, y_pred: np.ndarray, labels: list[int]) -> dict:
@@ -724,7 +1256,7 @@ def labeled_metrics_to_dict(metrics) -> dict:
         "class_precision": {str(k): float(v) for k, v in metrics.class_precision.items()},
         "class_recall": {str(k): float(v) for k, v in metrics.class_recall.items()},
         "class_f1": {str(k): float(v) for k, v in metrics.class_f1.items()},
-        "class_matches": {str(k): int(v) for k, v in metrics.class_matches.items()},
+        "class_matches": {str(k): float(v) for k, v in metrics.class_matches.items()},
         "class_pred_events": {str(k): int(v) for k, v in metrics.class_pred_events.items()},
         "class_true_events": {str(k): int(v) for k, v in metrics.class_true_events.items()},
     }
@@ -794,6 +1326,7 @@ def build_predicted_event_frame(
     min_distance: int,
     prominence: float,
     tolerance: int,
+    event_decoder: str,
 ) -> pd.DataFrame:
     rows = []
     ordered = pred_df.sort_values(["sample_id", "beat_idx"]).copy()
@@ -801,13 +1334,17 @@ def build_predicted_event_frame(
 
     for sample_id, group in ordered.groupby("sample_id", sort=False):
         group = group.reset_index(drop=True)
-        scores = group["detector_score"].to_numpy(dtype=np.float32)
-        pred_events = extract_events(
-            scores,
-            threshold=float(threshold),
-            min_distance=int(min_distance),
-            prominence=float(prominence),
-        )
+        if str(event_decoder) == "decoded" and "decoded_boundary" in group.columns:
+            pred_events = np.flatnonzero(group["decoded_boundary"].to_numpy(dtype=np.float32) > 0.5).astype(np.int32)
+        else:
+            scores = group["detector_score"].to_numpy(dtype=np.float32)
+            pred_events = decode_events(
+                scores,
+                threshold=float(threshold),
+                min_distance=int(min_distance),
+                prominence=float(prominence),
+                event_decoder=str(event_decoder),
+            )
         true_union_events = np.flatnonzero(group["union_target"].to_numpy(dtype=np.float32) > 0.5).astype(np.int32)
         match_pairs = greedy_match_pairs(pred_events, true_union_events, tolerance=int(tolerance))
         match_map = {pred_idx: (true_idx, offset) for pred_idx, true_idx, offset in match_pairs}
@@ -844,7 +1381,11 @@ def main():
     parser.add_argument("--config", required=True)
     parser.add_argument("--heldout_piece", nargs="+", required=True)
     parser.add_argument("--train_pieces", nargs="*", default=None)
-    parser.add_argument("--model", choices=["bilstm", "tcn", "cnn", "transformer"], default="tcn")
+    parser.add_argument(
+        "--model",
+        choices=["bilstm", "tcn", "cnn", "transformer", "bilstm_crf", "cnn_crf", "tcn_crf"],
+        default="tcn",
+    )
     parser.add_argument("--device", default="auto")
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--batch_size", type=int, default=None)
@@ -877,6 +1418,8 @@ def main():
             "level4plus_split56_boundary",
             "level34_boundary",
             "level56_boundary",
+            "weighted_all6_boundary",
+            "weighted_l1_l5_boundary",
         ],
         default="midhigh_boundary",
     )
@@ -897,13 +1440,35 @@ def main():
     parser.add_argument("--min_union_precision_floor", type=float, default=None)
     parser.add_argument("--min_frequency_weighted_precision_floor", type=float, default=None)
     parser.add_argument("--min_consensus_precision_floor", type=float, default=None)
-    parser.add_argument("--loss_type", choices=["bce", "bce_freq_weighted", "huber", "mse"], default="bce")
+    parser.add_argument("--loss_type", choices=["bce", "bce_freq_weighted", "huber", "mse", "crf_nll"], default="bce")
     parser.add_argument("--rest_span_label_mode", choices=["none", "expand_max", "canonical_ignore"], default="none")
     parser.add_argument("--rest_span_min_len", type=int, default=2)
     parser.add_argument("--rest_span_source_col", default="xml_rest_duration_norm")
     parser.add_argument("--rest_span_source_threshold", type=float, default=1e-8)
     parser.add_argument("--rest_span_tolerance_negative_weight", type=float, default=1.0)
     parser.add_argument("--min_train_frequency_target", type=float, default=0.0)
+    parser.add_argument("--label_engineering", choices=["none", "exponential_decay", "linear_ascend"], default="none")
+    parser.add_argument("--label_decay_radius", type=int, default=2)
+    parser.add_argument("--label_decay_rate", type=float, default=0.5)
+    parser.add_argument("--tempo_label_manifest", default=None)
+    parser.add_argument("--tempo_label_beat_tolerance", type=int, default=0)
+    parser.add_argument("--tempo_label_rel_tolerance", type=float, default=0.10)
+    parser.add_argument("--tempo_label_smooth_window", type=int, default=3)
+    parser.add_argument("--tempo_label_bpm_max", type=float, default=600.0)
+    parser.add_argument("--tempo_label_apply_split", default="train")
+    parser.add_argument("--center_margin", type=float, default=0.05)
+    parser.add_argument("--center_margin_weight", type=float, default=0.0)
+    parser.add_argument("--phase_loss_weight", type=float, default=0.0)
+    parser.add_argument("--linear_max_span", type=int, default=64)
+    parser.add_argument("--crf_state_count", type=int, default=64)
+    parser.add_argument("--crf_aux_regression_weight", type=float, default=0.0)
+    parser.add_argument("--crf_aux_regression_loss", choices=["smooth_l1", "mse"], default="smooth_l1")
+    parser.add_argument("--crf_aux_rank_weight", type=float, default=0.0)
+    parser.add_argument("--crf_aux_rank_margin", type=float, default=0.1)
+    parser.add_argument("--crf_aux_rank_min_freq_gap", type=float, default=0.05)
+    parser.add_argument("--crf_aux_rank_max_pairs", type=int, default=512)
+    parser.add_argument("--count_loss_weight", type=float, default=0.0)
+    parser.add_argument("--count_loss_mode", choices=["binary", "frequency"], default="binary")
     parser.add_argument("--skip_stage_grading", action="store_true")
     parser.add_argument("--add_derived_highlevel_features", action="store_true")
     parser.add_argument("--derived_feature_include", nargs="*", default=None)
@@ -920,7 +1485,15 @@ def main():
     parser.add_argument("--ema_decay", type=float, default=0.0)
     parser.add_argument("--cumulative_merge_tolerance", type=int, default=0)
     parser.add_argument("--cumulative_component_weights_json", type=str, default=None)
+    parser.add_argument("--event_decoder", choices=["peak", "crf"], default="peak")
+    parser.add_argument("--event_tolerance", type=int, default=None)
+    parser.add_argument("--eval_min_distance", type=int, default=None)
     args = parser.parse_args()
+    use_multistate_crf = str(args.model).endswith("_crf")
+    if use_multistate_crf:
+        args.event_decoder = "decoded"
+        if str(args.loss_type) != "crf_nll":
+            args.loss_type = "crf_nll"
 
     cfg = load_config(args.config)
     seq_cfg = cfg.get("sequence", {})
@@ -997,6 +1570,30 @@ def main():
         tolerance_negative_weight=float(args.rest_span_tolerance_negative_weight),
         min_train_frequency_target=float(args.min_train_frequency_target),
     )
+    tempo_label_stats = {"enabled": False}
+    tempo_label_skipped: list[dict] = []
+    if int(args.tempo_label_beat_tolerance) > 0:
+        mean_tempo_by_piece, tempo_label_skipped = build_mean_tempo_curves_for_labeling(
+            df,
+            manifest_path=args.tempo_label_manifest,
+            smooth_window=int(args.tempo_label_smooth_window),
+            bpm_max=float(args.tempo_label_bpm_max),
+        )
+        piece_df, tempo_label_stats = apply_tempo_tolerant_training_labels(
+            piece_df,
+            mean_tempo_by_piece=mean_tempo_by_piece,
+            beat_tolerance=int(args.tempo_label_beat_tolerance),
+            tempo_rel_tolerance=float(args.tempo_label_rel_tolerance),
+            apply_split=str(args.tempo_label_apply_split),
+        )
+    piece_df = apply_boundary_label_engineering(
+        piece_df,
+        mode=str(args.label_engineering),
+        decay_radius=int(args.label_decay_radius),
+        decay_rate=float(args.label_decay_rate),
+        linear_max_span=int(args.linear_max_span),
+    )
+    piece_df = apply_multistate_crf_labels(piece_df, state_count=int(args.crf_state_count))
 
     train_samples = piece_samples_from_frame(piece_df, feature_cols, split="train")
     val_samples = piece_samples_from_frame(piece_df, feature_cols, split="val")
@@ -1017,15 +1614,29 @@ def main():
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=collate_piece_union)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_piece_union)
 
-    model = build_sequence_model(args.model, input_dim=len(feature_cols), cfg=cfg, output_dim=1).to(device)
+    crf_state_count = int(args.crf_state_count)
+    crf_aux_extra_head = bool(
+        use_multistate_crf
+        and (float(args.crf_aux_regression_weight) > 0.0 or float(args.crf_aux_rank_weight) > 0.0)
+    )
+    output_dim = (
+        crf_state_count + (1 if crf_aux_extra_head else 0)
+        if use_multistate_crf
+        else (2 if str(args.label_engineering) == "linear_ascend" and float(args.phase_loss_weight) > 0.0 else 1)
+    )
+    model = build_sequence_model(args.model, input_dim=len(feature_cols), cfg=cfg, output_dim=output_dim).to(device)
+    crf = LinearChainCRF(num_states=crf_state_count).to(device) if use_multistate_crf else None
+    optimizer_params = list(model.parameters()) + (list(crf.parameters()) if crf is not None else [])
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        optimizer_params,
         lr=float(seq_cfg.get("lr", 1e-3)),
         weight_decay=float(seq_cfg.get("weight_decay", 1e-4)),
     )
 
     train_labels = np.concatenate([sample["train_frequency_target"] for sample in train_samples], axis=0)
-    if args.loss_type in {"bce", "bce_freq_weighted"}:
+    if use_multistate_crf:
+        loss_fn = nn.BCEWithLogitsLoss(reduction="none")
+    elif args.loss_type in {"bce", "bce_freq_weighted"}:
         pos = float(train_labels.sum())
         neg = float(train_labels.shape[0] - pos)
         pos_weight = torch.tensor([neg / max(pos, 1.0)], device=device, dtype=torch.float32)
@@ -1038,8 +1649,8 @@ def main():
         raise ValueError(f"Unsupported loss_type: {args.loss_type}")
 
     thresholds = threshold_grid(cfg)
-    tolerance = int(eval_cfg.get("event_tolerance", 1))
-    min_distance = int(eval_cfg.get("min_distance", 6))
+    tolerance = int(args.event_tolerance if args.event_tolerance is not None else eval_cfg.get("event_tolerance", 1))
+    min_distance = int(args.eval_min_distance if args.eval_min_distance is not None else eval_cfg.get("min_distance", 6))
     prominence = float(eval_cfg.get("prominence", 0.0))
     consensus_threshold = float(eval_cfg.get("consensus_threshold", 0.5))
     epochs = int(args.epochs or seq_cfg.get("epochs", 30))
@@ -1059,7 +1670,7 @@ def main():
     ema_decay = float(args.ema_decay)
     use_ema = ema_decay > 0.0
     ema_state = init_ema_state(model) if use_ema else None
-    ema_model = build_sequence_model(args.model, input_dim=len(feature_cols), cfg=cfg, output_dim=1).to(device) if use_ema else None
+    ema_model = build_sequence_model(args.model, input_dim=len(feature_cols), cfg=cfg, output_dim=output_dim).to(device) if use_ema else None
     precision_floors = resolve_precision_floors(args)
 
     best_epoch = 0
@@ -1074,6 +1685,7 @@ def main():
     for epoch in range(1, epochs + 1):
         train_loss = train_one_epoch(
             model=model,
+            crf=crf,
             loader=train_loader,
             optimizer=optimizer,
             device=device,
@@ -1083,6 +1695,17 @@ def main():
             ema_state=ema_state,
             ema_decay=ema_decay,
             log_interval=max(int(args.log_interval), 0),
+            center_margin=float(args.center_margin),
+            center_margin_weight=float(args.center_margin_weight),
+            phase_loss_weight=float(args.phase_loss_weight),
+            crf_aux_regression_weight=float(args.crf_aux_regression_weight),
+            crf_aux_regression_loss=str(args.crf_aux_regression_loss),
+            crf_aux_rank_weight=float(args.crf_aux_rank_weight),
+            crf_aux_rank_margin=float(args.crf_aux_rank_margin),
+            crf_aux_rank_min_freq_gap=float(args.crf_aux_rank_min_freq_gap),
+            crf_aux_rank_max_pairs=int(args.crf_aux_rank_max_pairs),
+            count_loss_weight=float(args.count_loss_weight),
+            count_loss_mode=str(args.count_loss_mode),
         )
         eval_model = model
         validation_model_name = "raw"
@@ -1090,29 +1713,40 @@ def main():
             ema_model.load_state_dict(ema_state)
             eval_model = ema_model
             validation_model_name = "ema"
-        val_pred = predict_detector(eval_model, val_loader, device=device)
+        val_pred = predict_detector(eval_model, val_loader, device=device, crf=crf)
         sequence_scores, sequence_union, sequence_frequency = detector_sequence_maps(val_pred)
-        metrics = search_union_frequency_threshold(
-            sequence_scores=sequence_scores,
-            sequence_union_labels=sequence_union,
-            sequence_frequency_targets=sequence_frequency,
-            thresholds=thresholds,
-            tolerance=tolerance,
-            min_distance=min_distance,
-            min_precision=float(args.min_precision),
-            consensus_threshold=consensus_threshold,
-            prominence=prominence,
-            primary_metric=str(args.selection_metric),
-            precision_metric=str(args.precision_metric),
-            min_union_precision=float(precision_floors["union_precision"]),
-            min_frequency_weighted_precision=float(precision_floors["frequency_weighted_precision"]),
-            min_consensus_precision=float(precision_floors["consensus_precision"]),
-        )
+        if use_multistate_crf:
+            metrics = evaluate_union_frequency_event_sets(
+                sequence_pred_events=decoded_event_maps(val_pred),
+                sequence_union_labels=sequence_union,
+                sequence_frequency_targets=sequence_frequency,
+                tolerance=tolerance,
+                threshold=0.5,
+                consensus_threshold=consensus_threshold,
+            )
+        else:
+            metrics = search_union_frequency_threshold(
+                sequence_scores=sequence_scores,
+                sequence_union_labels=sequence_union,
+                sequence_frequency_targets=sequence_frequency,
+                thresholds=thresholds,
+                tolerance=tolerance,
+                min_distance=min_distance,
+                min_precision=float(args.min_precision),
+                consensus_threshold=consensus_threshold,
+                prominence=prominence,
+                primary_metric=str(args.selection_metric),
+                precision_metric=str(args.precision_metric),
+                min_union_precision=float(precision_floors["union_precision"]),
+                min_frequency_weighted_precision=float(precision_floors["frequency_weighted_precision"]),
+                min_consensus_precision=float(precision_floors["consensus_precision"]),
+                event_decoder=str(args.event_decoder),
+            )
         selected_precision = precision_metric_value(metrics, str(args.precision_metric))
         precision_floor_met = precision_floors_met(metrics, precision_floors)
         primary_metric = primary_metric_value(metrics, str(args.selection_metric))
 
-        if checkpoint_avg_last_k > 0:
+        if checkpoint_avg_last_k > 0 and crf is None:
             recent_state_dicts.append((epoch, snapshot_state_dict(eval_model)))
 
         if scheduler is not None:
@@ -1165,26 +1799,46 @@ def main():
             best_val_pred = val_pred.copy()
             best_validation_model = validation_model_name
             bad_epochs = 0
-            torch.save(
-                {
-                    "model_state_dict": snapshot_state_dict(eval_model),
-                    "model_type": args.model,
-                    "feature_columns": feature_cols,
-                    "mean": mean,
-                    "std": std,
-                    "best_epoch": best_epoch,
-                    "detector_target": args.detector_target,
-                    "best_threshold": metrics.threshold,
-                    "min_precision": args.min_precision,
-                    "precision_metric": args.precision_metric,
-                    "selection_metric": args.selection_metric,
-                    "consensus_threshold": consensus_threshold,
-                    "loss_type": args.loss_type,
-                    "validation_model": validation_model_name,
-                    "ema_decay": ema_decay,
-                },
-                out_root / "detector_best.pt",
-            )
+            checkpoint_payload = {
+                "model_state_dict": snapshot_state_dict(eval_model),
+                "model_type": args.model,
+                "output_dim": int(output_dim),
+                "feature_columns": feature_cols,
+                "mean": mean,
+                "std": std,
+                "best_epoch": best_epoch,
+                "detector_target": args.detector_target,
+                "best_threshold": metrics.threshold,
+                "min_precision": args.min_precision,
+                "precision_metric": args.precision_metric,
+                "selection_metric": args.selection_metric,
+                "event_decoder": str(args.event_decoder),
+                "event_tolerance": int(tolerance),
+                "label_engineering": str(args.label_engineering),
+                "label_decay_radius": int(args.label_decay_radius),
+                "label_decay_rate": float(args.label_decay_rate),
+                "center_margin": float(args.center_margin),
+                "center_margin_weight": float(args.center_margin_weight),
+                "phase_loss_weight": float(args.phase_loss_weight),
+                "crf_aux_regression_weight": float(args.crf_aux_regression_weight),
+                "crf_aux_regression_loss": str(args.crf_aux_regression_loss),
+                "crf_aux_rank_weight": float(args.crf_aux_rank_weight),
+                "crf_aux_rank_margin": float(args.crf_aux_rank_margin),
+                "crf_aux_rank_min_freq_gap": float(args.crf_aux_rank_min_freq_gap),
+                "crf_aux_rank_max_pairs": int(args.crf_aux_rank_max_pairs),
+                "count_loss_weight": float(args.count_loss_weight),
+                "count_loss_mode": str(args.count_loss_mode),
+                "linear_max_span": int(args.linear_max_span),
+                "consensus_threshold": consensus_threshold,
+                "loss_type": args.loss_type,
+                "validation_model": validation_model_name,
+                "ema_decay": ema_decay,
+                "use_multistate_crf": bool(use_multistate_crf),
+                "crf_state_count": int(crf_state_count),
+            }
+            if crf is not None:
+                checkpoint_payload["crf_state_dict"] = snapshot_state_dict(crf)
+            torch.save(checkpoint_payload, out_root / "detector_best.pt")
         else:
             bad_epochs += 1
             if patience > 0 and bad_epochs >= patience:
@@ -1195,10 +1849,10 @@ def main():
         raise RuntimeError("Detector training did not produce validation metrics")
 
     checkpoint_average_summary = None
-    if checkpoint_avg_last_k > 1 and len(recent_state_dicts) >= 2:
+    if crf is None and checkpoint_avg_last_k > 1 and len(recent_state_dicts) >= 2:
         avg_epochs = [epoch_idx for epoch_idx, _ in recent_state_dicts]
         avg_state_dict = average_state_dicts([state for _, state in recent_state_dicts])
-        averaged_model = build_sequence_model(args.model, input_dim=len(feature_cols), cfg=cfg, output_dim=1).to(device)
+        averaged_model = build_sequence_model(args.model, input_dim=len(feature_cols), cfg=cfg, output_dim=output_dim).to(device)
         averaged_model.load_state_dict(avg_state_dict)
         avg_val_pred = predict_detector(averaged_model, val_loader, device=device)
         avg_sequence_scores, avg_sequence_union, avg_sequence_frequency = detector_sequence_maps(avg_val_pred)
@@ -1217,6 +1871,7 @@ def main():
             min_union_precision=float(precision_floors["union_precision"]),
             min_frequency_weighted_precision=float(precision_floors["frequency_weighted_precision"]),
             min_consensus_precision=float(precision_floors["consensus_precision"]),
+            event_decoder=str(args.event_decoder),
         )
         avg_selected_precision = precision_metric_value(avg_metrics, str(args.precision_metric))
         avg_precision_floor_met = precision_floors_met(avg_metrics, precision_floors)
@@ -1241,6 +1896,7 @@ def main():
             {
                 "model_state_dict": avg_state_dict,
                 "model_type": args.model,
+                "output_dim": int(output_dim),
                 "feature_columns": feature_cols,
                 "mean": mean,
                 "std": std,
@@ -1254,6 +1910,15 @@ def main():
                 "checkpoint_avg_last_k": checkpoint_avg_last_k,
                 "precision_metric": args.precision_metric,
                 "selection_metric": args.selection_metric,
+                "event_decoder": str(args.event_decoder),
+                "event_tolerance": int(tolerance),
+                "label_engineering": str(args.label_engineering),
+                "label_decay_radius": int(args.label_decay_radius),
+                "label_decay_rate": float(args.label_decay_rate),
+                "center_margin": float(args.center_margin),
+                "center_margin_weight": float(args.center_margin_weight),
+                "phase_loss_weight": float(args.phase_loss_weight),
+                "linear_max_span": int(args.linear_max_span),
                 "ema_decay": ema_decay,
             },
             out_root / "detector_lastk_avg.pt",
@@ -1268,6 +1933,7 @@ def main():
                 {
                     "model_state_dict": avg_state_dict,
                     "model_type": args.model,
+                    "output_dim": int(output_dim),
                     "feature_columns": feature_cols,
                     "mean": mean,
                     "std": std,
@@ -1281,6 +1947,15 @@ def main():
                     "checkpoint_avg_last_k": checkpoint_avg_last_k,
                     "precision_metric": args.precision_metric,
                     "selection_metric": args.selection_metric,
+                    "event_decoder": str(args.event_decoder),
+                    "event_tolerance": int(tolerance),
+                    "label_engineering": str(args.label_engineering),
+                    "label_decay_radius": int(args.label_decay_radius),
+                    "label_decay_rate": float(args.label_decay_rate),
+                    "center_margin": float(args.center_margin),
+                    "center_margin_weight": float(args.center_margin_weight),
+                    "phase_loss_weight": float(args.phase_loss_weight),
+                    "linear_max_span": int(args.linear_max_span),
                     "ema_decay": ema_decay,
                     "selected_from_lastk_average": True,
                 },
@@ -1291,7 +1966,8 @@ def main():
     val_df = piece_df[piece_df["protocol_split"] == "val"].copy()
     oracle_stage_grading = None
     class_event_metrics = None
-    if args.skip_stage_grading:
+    skip_stage_grading = bool(args.skip_stage_grading or use_multistate_crf)
+    if skip_stage_grading:
         merged_val = best_val_pred.copy()
     else:
         oracle_stage_grading, graded_val = train_stage_grader(
@@ -1327,6 +2003,7 @@ def main():
             tolerance=tolerance,
             min_distance=min_distance,
             prominence=prominence,
+            event_decoder=str(args.event_decoder),
         )
 
     merged_val.to_csv(out_root / "val_predictions.csv.gz", index=False, compression="gzip")
@@ -1341,6 +2018,7 @@ def main():
         "val_sequence_count": int(val_df["piece_sample_id"].nunique()),
         "model_type": args.model,
         "detector_target": args.detector_target,
+        "output_dim": int(output_dim),
         "model_hparams": {
             "transformer_dim": seq_cfg.get("transformer_dim"),
             "transformer_heads": seq_cfg.get("transformer_heads"),
@@ -1366,13 +2044,35 @@ def main():
         "ema_decay": float(ema_decay),
         "cumulative_merge_tolerance": int(args.cumulative_merge_tolerance),
         "cumulative_component_weights": cumulative_component_weights,
+        "event_decoder": str(args.event_decoder),
+        "event_tolerance": int(tolerance),
         "rest_span_label_mode": str(args.rest_span_label_mode),
         "rest_span_min_len": int(args.rest_span_min_len),
         "rest_span_source_col": str(args.rest_span_source_col),
         "rest_span_source_threshold": float(args.rest_span_source_threshold),
         "rest_span_tolerance_negative_weight": float(args.rest_span_tolerance_negative_weight),
         "min_train_frequency_target": float(args.min_train_frequency_target),
-        "skip_stage_grading": bool(args.skip_stage_grading),
+        "label_engineering": str(args.label_engineering),
+        "label_decay_radius": int(args.label_decay_radius),
+        "label_decay_rate": float(args.label_decay_rate),
+        "tempo_tolerant_train_labels": tempo_label_stats,
+        "tempo_label_manifest": str(args.tempo_label_manifest) if args.tempo_label_manifest else None,
+        "tempo_label_skipped": tempo_label_skipped,
+        "use_multistate_crf": bool(use_multistate_crf),
+        "crf_state_count": int(crf_state_count),
+        "crf_aux_regression_weight": float(args.crf_aux_regression_weight),
+        "crf_aux_regression_loss": str(args.crf_aux_regression_loss),
+        "crf_aux_rank_weight": float(args.crf_aux_rank_weight),
+        "crf_aux_rank_margin": float(args.crf_aux_rank_margin),
+        "crf_aux_rank_min_freq_gap": float(args.crf_aux_rank_min_freq_gap),
+        "crf_aux_rank_max_pairs": int(args.crf_aux_rank_max_pairs),
+        "count_loss_weight": float(args.count_loss_weight),
+        "count_loss_mode": str(args.count_loss_mode),
+        "center_margin": float(args.center_margin),
+        "center_margin_weight": float(args.center_margin_weight),
+        "phase_loss_weight": float(args.phase_loss_weight),
+        "linear_max_span": int(args.linear_max_span),
+        "skip_stage_grading": bool(skip_stage_grading),
         "precision_floor_met": bool(precision_floors_met(best_metrics, precision_floors)),
         "best_validation_model": str(best_validation_model),
         "union_metrics": union_metrics_to_dict(best_metrics),
@@ -1396,6 +2096,7 @@ def main():
         min_distance=min_distance,
         prominence=prominence,
         tolerance=tolerance,
+        event_decoder=str(args.event_decoder),
     )
     predicted_events.to_csv(out_root / "predicted_events.csv.gz", index=False, compression="gzip")
     print(

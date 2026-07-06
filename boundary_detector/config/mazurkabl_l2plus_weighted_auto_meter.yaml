@@ -1,0 +1,63 @@
+data:
+  beat_table_path: data/features/mazurkabl_handcrafted_beat_table.csv.gz
+  peak_distance: 6
+  peak_height: 0.15
+  peak_prominence: 0.05
+  long_note_threshold: 1.0
+  beat_unit_fallback: 1.0
+  symmetry_window: 4
+  deviation_window: 8
+  measure_cycle: 3
+evaluation:
+  event_tolerance: 1
+  min_distance: 6
+  prominence: 0.0
+  threshold_grid:
+    start: 0.05
+    stop: 0.95
+    steps: 37
+features:
+  exclude:
+    - beat_pos_in_measure
+    - phase3_sin
+    - phase3_cos
+    - phase4_sin
+    - phase4_cos
+    - downbeat_mod3
+    - downbeat_mod4
+    - barline_proximity_mod3
+    - barline_proximity_mod4
+    - mean_pitch_norm
+    - pitch_range_norm
+    - mean_duration_norm
+    - pitch_std_norm
+    - pc_cos_prev
+    - xml_rest_count
+    - xml_tie_start_ratio
+    - xml_tie_continue_ratio
+    - xml_slur_start_ratio
+    - xml_repeat_start
+    - xml_active_pc_entropy
+    - xml_active_pc_unique_ratio
+    - xml_active_pc_cos_prev
+    - xml_active_pc_cos_next
+    - measure_number
+    - beat_in_measure
+sequence:
+  output_dir: outputs/sequence
+  model_type: cnn
+  batch_size: 8
+  epochs: 18
+  lr: 0.001
+  weight_decay: 0.0001
+  grad_clip: 1.0
+  early_stop_patience: 5
+  seed: 42
+  hidden_dim: 64
+  num_layers: 2
+  dropout: 0.2
+  tcn_channels:
+    - 64
+    - 64
+    - 64
+  kernel_size: 3

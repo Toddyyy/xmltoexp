@@ -30,8 +30,19 @@ CUMULATIVE_COMPONENTS: dict[str, tuple[str, ...]] = {
 }
 
 
+WEIGHTED_SUM_COMPONENTS: dict[str, tuple[str, ...]] = {
+    "weighted_all6_boundary": ("level6", "level5", "level4", "level3", "level2", "level1"),
+    "weighted_l1_l5_boundary": ("level56", "level4", "level3", "level2", "level1"),
+}
+
+
 def cumulative_components_for_target(target_mode: str) -> tuple[str, ...] | None:
     components = CUMULATIVE_COMPONENTS.get(str(target_mode))
+    return tuple(components) if components is not None else None
+
+
+def weighted_sum_components_for_target(target_mode: str) -> tuple[str, ...] | None:
+    components = WEIGHTED_SUM_COMPONENTS.get(str(target_mode))
     return tuple(components) if components is not None else None
 
 
@@ -150,6 +161,46 @@ def build_topdown_cumulative_frequency(
                     "piece_id": piece_id,
                     "beat_idx": piece_beats,
                     "frequency_target": merged_freq,
+                }
+            )
+        )
+    if not rows:
+        return pd.DataFrame(columns=["piece_id", "beat_idx", "frequency_target"])
+    merged = pd.concat(rows, ignore_index=True)
+    merged["frequency_target"] = merged["frequency_target"].astype(np.float32)
+    return merged
+
+
+def build_weighted_sum_frequency(
+    base_piece: pd.DataFrame,
+    component_map: dict[str, pd.DataFrame],
+    component_order: tuple[str, ...],
+    component_weights: dict[str, float] | None = None,
+    clip_max: float = 1.0,
+) -> pd.DataFrame:
+    rows: list[pd.DataFrame] = []
+    for piece_id, piece_frame in base_piece.groupby("piece_id", sort=False):
+        piece_frame = piece_frame.sort_values("beat_idx").reset_index(drop=True)
+        piece_beats = piece_frame["beat_idx"].to_numpy(dtype=np.int32)
+        beat_to_pos = {int(beat): idx for idx, beat in enumerate(piece_beats.tolist())}
+        weighted_freq = np.zeros(piece_beats.shape[0], dtype=np.float32)
+        for component_name in component_order:
+            component_df = component_map.get(component_name)
+            if component_df is None or component_df.empty:
+                continue
+            component_weight = float((component_weights or {}).get(component_name, 1.0))
+            for row in component_df[component_df["piece_id"] == piece_id].itertuples(index=False):
+                pos = beat_to_pos.get(int(row.beat_idx))
+                if pos is not None:
+                    weighted_freq[pos] += float(row.frequency_target) * component_weight
+        if float(clip_max) > 0.0:
+            weighted_freq = np.minimum(weighted_freq, float(clip_max)).astype(np.float32)
+        rows.append(
+            pd.DataFrame(
+                {
+                    "piece_id": piece_id,
+                    "beat_idx": piece_beats,
+                    "frequency_target": weighted_freq.astype(np.float32),
                 }
             )
         )

@@ -57,6 +57,11 @@ def candidate_slug(candidate: dict) -> str:
         "selection_metric",
         "min_precision",
         "loss_type",
+        "label_engineering",
+        "crf_state_count",
+        "cumulative_merge_tolerance",
+        "event_decoder",
+        "event_tolerance",
         "rest_span_label_mode",
         "rest_span_tolerance_negative_weight",
     ]
@@ -88,10 +93,20 @@ def build_base_candidate(args: argparse.Namespace) -> dict:
         "rest_span_label_mode": str(args.rest_span_label_mode),
         "rest_span_tolerance_negative_weight": float(args.rest_span_tolerance_negative_weight),
         "min_train_frequency_target": float(args.min_train_frequency_target),
+        "label_engineering": str(args.label_engineering),
+        "label_decay_radius": int(args.label_decay_radius),
+        "label_decay_rate": float(args.label_decay_rate),
+        "center_margin": float(args.center_margin),
+        "center_margin_weight": float(args.center_margin_weight),
+        "phase_loss_weight": float(args.phase_loss_weight),
+        "linear_max_span": int(args.linear_max_span),
+        "crf_state_count": int(args.crf_state_count),
         "cumulative_merge_tolerance": int(args.cumulative_merge_tolerance),
         "cumulative_component_weights_json": str(args.cumulative_component_weights_json)
         if args.cumulative_component_weights_json is not None
         else None,
+        "event_decoder": str(args.event_decoder),
+        "event_tolerance": None if args.event_tolerance is None else int(args.event_tolerance),
         "device": str(args.device),
         "batch_size": int(args.batch_size) if args.batch_size is not None else None,
         "epochs": int(args.epochs) if args.epochs is not None else None,
@@ -166,8 +181,18 @@ def run_protocol(
         "rest_span_label_mode",
         "rest_span_tolerance_negative_weight",
         "min_train_frequency_target",
+        "label_engineering",
+        "label_decay_radius",
+        "label_decay_rate",
+        "center_margin",
+        "center_margin_weight",
+        "phase_loss_weight",
+        "linear_max_span",
+        "crf_state_count",
         "cumulative_merge_tolerance",
         "cumulative_component_weights_json",
+        "event_decoder",
+        "event_tolerance",
         "device",
         "batch_size",
         "epochs",
@@ -240,8 +265,18 @@ def main() -> None:
     parser.add_argument("--rest_span_label_mode", default="none")
     parser.add_argument("--rest_span_tolerance_negative_weight", type=float, default=1.0)
     parser.add_argument("--min_train_frequency_target", type=float, default=0.0)
+    parser.add_argument("--label_engineering", choices=["none", "exponential_decay", "linear_ascend"], default="none")
+    parser.add_argument("--label_decay_radius", type=int, default=2)
+    parser.add_argument("--label_decay_rate", type=float, default=0.5)
+    parser.add_argument("--center_margin", type=float, default=0.05)
+    parser.add_argument("--center_margin_weight", type=float, default=0.0)
+    parser.add_argument("--phase_loss_weight", type=float, default=0.0)
+    parser.add_argument("--linear_max_span", type=int, default=64)
+    parser.add_argument("--crf_state_count", type=int, default=64)
     parser.add_argument("--cumulative_merge_tolerance", type=int, default=0)
     parser.add_argument("--cumulative_component_weights_json", default=None)
+    parser.add_argument("--event_decoder", choices=["peak", "crf"], default="peak")
+    parser.add_argument("--event_tolerance", type=int, default=None)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--epochs", type=int, default=None)
